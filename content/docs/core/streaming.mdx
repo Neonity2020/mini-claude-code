@@ -1,0 +1,277 @@
+---
+title: 流式响应
+description: 用 SSE 让输出逐字出现，并搞清楚流式模式下工具入参是怎么被拼装出来的。
+---
+
+本章你会让终端里的输出像打字一样逐字出现，同时弄清一个隐藏的坑：流式模式下，工具的入参是**分片**到达的。
+
+## 为什么要流式
+
+非流式请求要等模型把整段话生成完才返回。对一个要读文件再回答的问题，这段时间是纯白屏。
+
+流式把这段等待切成两段：
+
+- **首字延迟（TTFT）**：从发出请求到第一个 token 到达
+- **总时长**：到最后一个 token 到达
+
+流式让用户看到 TTFT 而不是总时长。体感差别巨大——尤其是模型要先读几个文件再回答的任务。
+
+<Callout type="idea" title="但流式不是纯 UX 优化">
+  它还顺带解决了另一个问题：拿不到流式的实时事件，你就没法知道
+  模型正在调哪个工具、参数拼到哪了。一个成熟 CLI 会在流式过程中
+  就把「正在调用 Read」显示出来，而不是等整个工具调用结束。
+</Callout>
+
+## 两种调用方式
+
+Anthropic SDK 提供两个入口：
+
+```ts
+// 非流式：一次性拿到完整响应
+const message = await client.messages.create({ model, max_tokens, messages });
+
+// 流式：事件一个一个到达
+const stream = client.messages.stream({ model, max_tokens, messages });
+```
+
+`messages.create()` 返回的是一个 Promise。`messages.stream()` 返回的是一个 `MessageStream` 对象，它同时是事件发射器和异步可迭代对象。
+
+## 最简单的用法
+
+SDK 已经帮你处理了绝大部分繁琐工作：
+
+```ts title="src/agent.ts"
+async #callModel() {
+  const stream = this.#options.client.messages.stream(
+    {
+      model: this.#options.model,
+      max_tokens: 8_192,
+      system: this.#options.systemPrompt,
+      messages: this.#messages,
+      tools: this.#options.tools.toAnthropicTools(),
+    },
+    { signal: this.#controller.signal },
+  );
+
+  stream.on('text', (delta) => {
+    this.#options.onText?.(delta);
+  });
+
+  // finalMessage() 会把流式片段拼装成一条完整的 Message，
+  // 包括工具入参的分片 JSON
+  return await stream.finalMessage();
+}
+```
+
+两个要点：
+
+1. `stream.on('text', ...)` 的回调里，`delta` 是**增量**，不是累计文本。直接追加输出即可，不要覆盖。
+2. `await stream.finalMessage()` 返回的是一条**完整的 `Message`**，和 `create()` 返回的结构完全一致。
+
+这就是我们能在同一个循环里既流式输出、又拿到完整响应的原因。
+
+<Callout type="warn" title="别自己拼 finalMessage">
+  下面的写法是错的：`stream.on('text', ...)` 的回调是同步触发的，
+  你在里面 `await` 任何东西都会打乱事件处理顺序。要等流结束，
+  用 `finalMessage()`、`done()` 或 `for await` 迭代。
+</Callout>
+
+## 可用的事件
+
+`MessageStream` 支持这些事件名：
+
+| 事件 | 回调参数 | 用途 |
+| --- | --- | --- |
+| `connect` | — | HTTP 连接建立 |
+| `text` | `(delta, snapshot)` | 文本增量，最常用 |
+| `inputJson` | `(partialJson, jsonSnapshot)` | 工具入参的 JSON 分片 |
+| `thinking` | `(delta, snapshot)` | 扩展思考内容 |
+| `signature` | `(signature)` | 思考块的签名 |
+| `contentBlock` | `(block)` | 一个内容块完整结束 |
+| `message` | `(message)` | 消息对象更新 |
+| `finalMessage` | `(message)` | 最终消息 |
+| `error` | `(error)` | 出错 |
+| `abort` | `(error)` | 被取消 |
+| `end` | — | 流结束 |
+
+大部分时候你只需要 `text` 和 `finalMessage`。
+
+## 底层：如果你想手写
+
+SDK 帮你藏起来的东西，其实是一套 SSE 事件。理解它有助于你调试问题——比如「为什么工具参数是空的」。
+
+```ts
+// 伪代码：SDK 内部在做的事
+for await (const event of stream) {
+  switch (event.type) {
+    case 'message_start':
+      // 拿到 message id、model、初始 usage
+      break;
+
+    case 'content_block_start':
+      // 开始一个内容块：text / tool_use / thinking
+      // tool_use 块在这里给出 id 和 name，但 input 是空的
+      break;
+
+    case 'content_block_delta':
+      // 这个块的新增内容
+      if (event.delta.type === 'text_delta') {
+        // 文本增量
+      } else if (event.delta.type === 'input_json_delta') {
+        // 工具入参的 JSON 片段
+      }
+      break;
+
+    case 'content_block_stop':
+      // 当前块结束
+      break;
+
+    case 'message_delta':
+      // stop_reason 和 usage 在这里，不在 content_block 里
+      break;
+
+    case 'message_stop':
+      break;
+  }
+}
+```
+
+## 那个坑：工具入参是分片的
+
+这是本章最值得记住的一点。
+
+当模型请求调用工具时，入参不是一次性返回的完整 JSON，而是**被切成若干片段**逐个发过来：
+
+```jsonc
+// 第一个分片
+{"partial_json": "{\"file_"}
+// 第二个分片
+{"partial_json": "path\": \"src/"}
+// 第三个分片
+{"partial_json": "app.ts\"}"}
+```
+
+完整入参要等所有分片拼完才是合法 JSON。
+
+好消息是 SDK 的 `finalMessage()` 已经替你拼好了——`input` 字段是一个完整的对象，不是字符串。
+
+坏消息是：**如果你绕过 SDK 自己处理流，就必须自己累积。** 忘了累积，你会拿到 `input` 是空对象或者半截 JSON 的 `tool_use` 块，然后在 `schema.parse()` 时报一个莫名其妙的下标错误。
+
+```ts title="src/agent.ts（伪代码，示意 SDK 底层在做的事）"
+// 前提：假设我们手写了流处理，tool_use 块的入参需要自己攒
+const partialJson: string[] = [];
+
+for await (const event of stream) {
+  if (
+    event.type === 'content_block_delta' &&
+    event.delta.type === 'input_json_delta'
+  ) {
+    partialJson.push(event.delta.partial_json);
+  }
+}
+
+// 攒完再解析
+const input = JSON.parse(partialJson.join(''));
+```
+
+`finalMessage()` 内部做的就是这件事（外加处理多个内容块、thinking 块等边界情况）。
+
+<Callout type="idea" title="为什么模型要这么干">
+  分片传输是 SSE 的自然形态——服务端不知道最终输出有多长，只能边生成边发。
+  工具参数也是模型逐 token「写」出来的，所以必然是分片的。
+  如果你看到工具参数为空，第一反应应该是「流没拼完」，而不是「模型没填参数」。
+</Callout>
+
+## stop_reason 在哪
+
+另一个容易找错的地方：`stop_reason` **不在内容块里**，它在 `message_delta` 事件里。
+
+所以在流式代码里，如果你想在拿到内容块的同时就知道「这轮是不是要调工具」，得等到流的末尾。这也是为什么我们的实现是：流式渲染文本，`finalMessage()` 之后再统一处理工具。
+
+顺序很重要：先流式输出，最后再拿完整消息判断 `stop_reason`。
+
+```ts title="src/agent.ts"
+const assistantMessage = await this.#callModel();
+const reasoning = (assistantMessage as typeof assistantMessage & { reasoning_content?: string }).reasoning_content;
+this.#messages.push({ role: 'assistant', content: assistantMessage.content, ...(reasoning !== undefined ? { reasoning_content: reasoning } : {}) });
+
+const toolUses = assistantMessage.content.filter(
+  (block): block is ToolUseBlock => block.type === 'tool_use',
+);
+
+// 没有工具调用 -> 这一轮结束
+if (assistantMessage.stop_reason !== 'tool_use' || toolUses.length === 0) {
+  return;
+}
+```
+
+## 取消
+
+用户按 Ctrl+C 时，要能把正在跑的请求和子进程都停掉。
+
+`MessageStream` 自带 `abort()`，但我们用的是 `AbortSignal` 的方式，因为同一个信号还要传给 Bash 工具去 kill 子进程：
+
+```ts title="src/agent.ts"
+#controller = new AbortController();
+
+// ...
+
+{ signal: this.#controller.signal },
+
+// ...
+
+abort(): void {
+  this.#controller.abort();
+}
+```
+
+<Callout type="idea" title="为什么 controller 不是 readonly">
+  取消信号是一次性的。`AbortController.abort()` 之后，这个 signal 永远
+  处于 aborted 状态，没法「复活」。所以每轮对话开始时都要造一个新的
+  controller（见 [Agent 循环](/docs/core/agent-loop) 里的 `run()`），
+  否则用户取消过一次之后，后面每一轮请求都会立刻被自己取消掉。
+</Callout>
+
+<Callout type="warn" title="信号要一路传到底">
+  只中断 HTTP 请求是不够的——如果 Bash 工具起的 `npm test` 还在跑，
+  进程会变成孤儿继续吃 CPU。信号必须同时传到工具层，
+  在 `spawn` 时传 `signal`，子进程才会被一并终止。
+</Callout>
+
+## 验证
+
+跑起来看看流式效果：
+
+```bash
+cd examples/mini-claude-code
+export LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=sk-ant-xxx
+pnpm start
+```
+
+输入一个长回答型的问题，比如：
+
+```
+› 用三段话解释什么是 agent loop
+```
+
+你会看到文字逐字出现，而不是等几秒后整段蹦出来。
+
+工具调用的流式效果则要看模型什么时候决定调工具：
+
+```
+› 列出 src/tools/ 下的所有文件
+```
+
+`Glob` 的调用信息会在模型思考完之后出现，然后终端打印出结果。
+
+## 小结
+
+- 流式的核心价值是降低感知延迟，同时让工具调用状态能实时显示
+- `stream.on('text', ...)` 拿增量，`await stream.finalMessage()` 拿完整消息
+- 工具入参是分片 JSON，SDK 的 `finalMessage()` 已帮你拼好；手写则必须自己累积
+- `stop_reason` 在 `message_delta` 里，不在内容块里
+- 用 `AbortSignal` 把取消信号同时传给 HTTP 请求和子进程
+
+下一章我们把消息格式这件事彻底讲清楚——`tool_use` 和 `tool_result` 到底长什么样，
+以及为什么工具结果必须以 user 消息回传。

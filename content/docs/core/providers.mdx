@@ -1,0 +1,345 @@
+---
+title: 多模型接入
+description: 用一套 Anthropic 消息协议作为内层接口，背后接住 Anthropic、OpenAI 与各种 OpenAI 兼容服务。
+---
+
+本章你会得到一个能同时对接多家模型服务的 agent——上层代码完全不变，只换一个环境变量就能切过去。
+
+<Callout type="info" title="这一章的前提">
+  前三章讲的都是「怎么跟 Anthropic 说话」。本章讲的是：当你想换一家
+  模型服务商时，要付出什么代价。答案是——比想象的多。
+</Callout>
+
+## 为什么需要 provider 抽象
+
+先说清楚动机。三家服务商的工具调用长得很像，但**协议并不相同**：
+
+| 维度 | Anthropic | OpenAI 兼容 |
+| --- | --- | --- |
+| 系统提示词 | 顶层参数 `system` | `messages` 里的一条 `role: 'system'` |
+| 模型请求调工具 | assistant 消息里的 `tool_use` 块 | assistant 消息里的 `tool_calls` 数组 |
+| 工具入参 | 已经是对象 `{ file_path: '...' }` | **JSON 字符串** `'{"file_path":"..."}'` |
+| 工具结果 | user 消息里的 `tool_result` 块，**多个结果挤在同一条消息** | `role: 'tool'` 消息，**一个结果一条消息** |
+| 结束标志 | `stop_reason: 'tool_use'` | `finish_reason: 'tool_calls'` |
+| 推理内容 | 无此概念 | `reasoning_content` 字段 |
+
+如果把 provider 直接写进 agent 循环，`#runTool` 里就会长出这种代码：
+
+```ts
+// 反面教材，不要这么写
+if (provider === 'openai') {
+  messages.push({ role: 'tool', tool_call_id: id, content: result });
+} else {
+  messages.push({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: result }] });
+}
+```
+
+每加一家服务商，所有跟消息打交道的代码都要改一遍。**这就是抽象要解决的问题：把变化收敛到一个文件里。**
+
+## 设计：接口收敛，实现发散
+
+我们的做法是——**对外只暴露 Anthropic 的消息协议，对内藏起所有差异**。
+
+```ts title="src/llm.ts"
+export function getProvider(): 'mimo' | 'anthropic' | 'openai' {
+  const value = process.env.LLM_PROVIDER ?? 'mimo';
+  if (value !== 'mimo' && value !== 'anthropic' && value !== 'openai') throw new Error('LLM_PROVIDER 必须是 mimo、anthropic 或 openai。');
+  return value;
+}
+```
+
+`getProvider()` 是唯一的决策点。模型名也跟着 provider 走：
+
+```ts title="src/llm.ts"
+export function getModel(): string {
+  const provider = getProvider();
+  return provider === 'mimo' ? (process.env.MIMO_MODEL ?? 'mimo-v2.6-flash').replace(/^mimo\//, '')
+    : provider === 'openai' ? (process.env.OPENAI_MODEL ?? 'gpt-4.1') : (process.env.ANTHROPIC_MODEL ?? DEFAULT_MODEL);
+}
+```
+
+注意 mimo 那支的 `.replace(/^mimo\//, '')`——配置里写 `mimo/mimo-v2.6-flash` 和写
+`mimo-v2.6-flash` 都能用。模型名在不同服务商的命名空间里带不带前缀不一样，
+这种小差异在装配层抹平最省事。
+
+## 客户端装配：返回类型恒定
+
+关键在 `createClient()`——**不管底下是谁，返回类型永远是 `Anthropic`**：
+
+```ts title="src/llm.ts"
+export function createClient(): Anthropic {
+  const provider = getProvider();
+  if (provider === 'mimo') {
+    const apiKey = process.env.MIMO_API_KEY;
+    if (!apiKey) throw new Error('缺少 MIMO_API_KEY。请设置 MiMo Token Plan 订阅密钥（tp-...）。');
+    return createOpenAIClient({ apiKey, baseURL: process.env.MIMO_BASE_URL ?? 'https://token-plan-cn.xiaomimimo.com/v1' });
+  }
+  // ...
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      '缺少 ANTHROPIC_API_KEY 环境变量。\n' +
+        '请先执行：export ANTHROPIC_API_KEY=sk-ant-xxx',
+    );
+  }
+  return new Anthropic({ apiKey });
+}
+```
+
+`createClient()` 的返回类型是 `Anthropic`，但第三行返回的 `createOpenAIClient(...)`
+实际上是一个**手写的假 Anthropic 客户端**。于是 `src/agent.ts` 里这行代码，
+在三家服务商下跑起来一模一样：
+
+```ts title="src/agent.ts"
+const stream = this.#options.client.messages.stream(
+  {
+    model: this.#options.model,
+    max_tokens: 8_192,
+    system: this.#options.systemPrompt,
+    messages: this.#messages,
+    tools: this.#options.tools.toAnthropicTools(),
+  },
+  { signal: this.#controller.signal },
+);
+```
+
+<Callout type="idea" title="为什么以 Anthropic 为「内层协议」">
+  因为 Anthropic 的协议表达力更强：工具入参是**对象**而不是 JSON 字符串，
+  多个工具结果可以放进同一条消息，工具调用有独立的 `id` 可以对应。
+  用表达力更强的协议做内部标准，适配到表达力更弱的协议时才需要做有损转换；
+  反过来做则需要凭空造字段。
+</Callout>
+
+## 消息翻译：两套协议怎么对齐
+
+真正的难点在这里。`toOpenAIMessages()` 要把 Anthropic 的历史翻译成 OpenAI 的：
+
+```ts title="src/openai.ts"
+export function toOpenAIMessages(messages: MessageParam[], system?: string): ChatMessage[] {
+  const result: ChatMessage[] = system ? [{ role: 'system', content: system }] : [];
+  for (const message of messages) {
+    if (typeof message.content === 'string') { result.push({ role: message.role, content: message.content }); continue; }
+    if (message.role === 'assistant') {
+      const text = message.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
+      const calls = message.content.filter((b) => b.type === 'tool_use').map((b) => ({ id: b.id, type: 'function', function: { name: b.name, arguments: JSON.stringify(b.input) } }));
+      const reasoning = (message as MessageParam & { reasoning_content?: string }).reasoning_content;
+      result.push({ role: 'assistant', content: text || null, ...(reasoning !== undefined ? { reasoning_content: reasoning } : {}), ...(calls.length ? { tool_calls: calls } : {}) });
+    } else {
+      for (const block of message.content) {
+        if (block.type === 'tool_result') result.push({ role: 'tool', tool_call_id: block.tool_use_id, content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? '') });
+        else if (block.type === 'text') result.push({ role: 'user', content: block.text });
+      }
+    }
+  }
+  return result;
+}
+```
+
+三个值得盯住的地方：
+
+**一、系统提示词从顶层降级成了消息。** Anthropic 里 `system` 是独立参数，
+翻译过来就得塞进 `messages` 数组的第一条。
+
+**二、工具入参要序列化成字符串。** Anthropic 给的是对象：
+
+```json
+{ "file_path": "src/app.ts" }
+```
+
+OpenAI 要的是字符串：
+
+```json
+{ "arguments": "{\"file_path\":\"src/app.ts\"}" }
+```
+
+多一层转义，看着别扭，但这正是「以表达力更强的协议做内部标准」的代价。
+
+**三、工具结果必须拆开。** Anthropic 把同轮的多个 `tool_result` 放在**一条**
+user 消息里；OpenAI 要求**一个结果一条消息**。所以 `else` 分支里用的是
+`for` 循环逐块 push，而不是一次性 push 一个数组。
+
+<Callout type="warn" title="这是最容易写错的一处">
+  如果偷懒把多个 `tool_result` 塞进一条 `role: 'tool'` 消息，部分兼容服务
+  会直接报错，部分会静默丢弃后面的结果——后者更可怕，因为 agent 会拿着
+  不完整的历史继续跑，看起来一切正常。
+</Callout>
+
+## 发请求
+
+适配层自己拼请求，不依赖任何 SDK：
+
+```ts title="src/openai.ts"
+const request = async (params: Request, stream: boolean, signal?: AbortSignal) => {
+  const response = await (options.fetch ?? fetch)(`${base}/chat/completions`, {
+    method: 'POST', signal,
+    headers: { 'Authorization': `Bearer ${options.apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: params.model, messages: toOpenAIMessages(params.messages, params.system), stream,
+      ...(params.tools?.length ? { tools: params.tools.map((tool) => ({ type: 'function', function: { name: tool.name, description: tool.description, parameters: tool.input_schema } })) } : {}),
+    }),
+  });
+  if (!response.ok) throw new Error(`OpenAI API 错误 (${response.status}): ${(await response.text()).slice(0, 2000)}`);
+  return response;
+};
+```
+
+工具描述的字段映射是 `{name, description, input_schema}` → `{name, description, parameters}`。
+
+错误处理只有一行，但做了件重要的事：**把响应体截断到 2000 字符**。兼容服务的
+报错信息经常是一大坨 JSON，不截断的话会淹没掉真正的错误原因。
+
+## 手写 SSE 解析
+
+Anthropic SDK 帮你解析 SSE，OpenAI 这边没有——`src/openai.ts` 里手写了一份。
+
+先看帧的切分。SSE 用**空行**分隔事件：
+
+```ts title="src/openai.ts"
+while (true) {
+  const item = await reader.read();
+  buffer += decoder.decode(item.value, { stream: !item.done });
+  let match: RegExpExecArray | null;
+  while ((match = /\r?\n\r?\n/.exec(buffer))) { event(buffer.slice(0, match.index)); buffer = buffer.slice(match.index + match[0].length); }
+  if (item.done) break;
+}
+if (buffer.trim()) event(buffer);
+```
+
+注意 `decoder.decode(item.value, { stream: !item.done })`——第二个参数是
+`{ stream: true }` 时，decoder 会**保留不完整的 UTF-8 字节**等下一块拼上。
+少了这个参数，一个中文 emoji 被切在两个网络包里，就会变成乱码。
+
+<Callout type="idea" title="这是流式编程的隐藏坑">
+  `TextDecoder` 默认按完整输入解码，中文一个字 3 字节，被切成两半就会
+  解出 `�`。凡是处理流式文本的地方，都要用 `{ stream: true }`。
+</Callout>
+
+再看待处理函数怎么拆帧、怎么拼内容：
+
+```ts title="src/openai.ts"
+const data = raw.split(/\r?\n/).filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trimStart()).join('\n');
+if (!data) return;
+if (data === '[DONE]') { done = true; return; }
+const chunk = JSON.parse(data) as Chunk;
+if (chunk.error) throw new Error(chunk.error.message || 'OpenAI 流返回错误');
+const choice = chunk.choices?.[0];
+if (!choice) return;
+if (choice.finish_reason) finish = choice.finish_reason;
+if (choice.delta?.reasoning_content != null) { reasoning += choice.delta.reasoning_content; hasReasoning = true; }
+if (choice.delta?.content) { text += choice.delta.content; onText(choice.delta.content); }
+```
+
+`data:` 后面可能有多行，所以这里用 `join('\n')` 拼回来；`[DONE]` 是 SSE 的结束标记。
+
+### 工具参数按 index 累积
+
+这是 OpenAI 流式协议和 Anthropic 最大的结构差异。
+
+Anthropic 的工具入参是一个内容块内部的连续分片；OpenAI 则是**整个流里平铺着
+若干个 `tool_calls`，靠 `index` 区分是第几个工具**，而且 id、函数名、参数
+三者分别分片下发。
+
+```ts title="src/openai.ts"
+for (const part of choice.delta?.tool_calls ?? []) {
+  const call = calls.get(part.index) ?? { id: '', name: '', args: '' };
+  if (part.id) call.id += part.id;
+  if (part.function?.name) call.name += part.function.name;
+  if (part.function?.arguments) call.args += part.function.arguments;
+  calls.set(part.index, call);
+}
+```
+
+用 `Map<number, {...}>` 按 index 归堆。注意 `+=` 是拼接——id 和函数名也可能
+被拆开，要累加而不是覆盖。
+
+最后拼回 Anthropic 的形状：
+
+```ts title="src/openai.ts"
+const content: Array<Record<string, unknown>> = text ? [{ type: 'text', text }] : [];
+for (const call of calls.values()) {
+  if (!call.id || !call.name) throw new Error('OpenAI 工具调用缺少 ID 或名称');
+  let input: unknown;
+  try { input = JSON.parse(call.args || '{}'); } catch { throw new Error(`OpenAI 工具 ${call.name} 返回无效 JSON`); }
+  content.push({ type: 'tool_use', id: call.id, name: call.name, input });
+}
+if (finish === 'tool_calls' && !calls.size) throw new Error('OpenAI 未返回工具调用');
+return { content, stop_reason: calls.size ? 'tool_use' : 'end_turn', ...(hasReasoning ? { reasoning_content: reasoning } : {}) };
+```
+
+最后一行是整个适配层的收官：**把 OpenAI 的结束标志翻译回 Anthropic 的 `stop_reason`**。
+
+| OpenAI `finish_reason` | Anthropic `stop_reason` |
+| --- | --- |
+| `tool_calls` | `tool_use` |
+| `stop` | `end_turn` |
+| `length` | `max_tokens` |
+
+上层的 `#callModel()` 拿到这份结果后，和 Anthropic 路径下的行为**完全一致**——
+它不知道也不需要知道底下是谁。
+
+<Callout type="warn" title="「工具调用但没有内容」的边界情况">
+  `finish === 'tool_calls'` 却一个调用都没收到，是协议被截断的信号。
+  这时候必须报错而不是静默返回空内容——上层会以为「模型说完了」，
+  于是结束整个循环，任务被无声地丢掉。
+</Callout>
+
+## 验证
+
+三个 provider 各跑一遍，同一个任务：
+
+```bash
+cd examples/mini-claude-code
+
+# Anthropic
+LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-xxx pnpm start
+
+# OpenAI
+LLM_PROVIDER=openai OPENAI_API_KEY=sk-xxx pnpm start
+
+# OpenAI 兼容服务（默认走 MiMo）
+MIMO_API_KEY=tp-xxx pnpm start
+```
+
+进去之后问同一句：
+
+```
+› 看看 src/agent.ts 里 agent 循环是怎么写的
+```
+
+三条路径的终端输出应该长得**几乎一样**——工具调用、结果回传、总结输出，
+全都走同一套 agent 循环代码。差别只在模型本身的回答风格。
+
+## 代价：这套抽象的边界
+
+适配层不是完整的协议实现，它有一批明确的缺口。知道这些，比假装它很完善更有用：
+
+- **只实现了 `messages.stream()` 和 `messages.create()` 两个方法。** Anthropic SDK
+  还有 `countTokens`、`batches` 等，适配层一概没有。上下文预算因此走的是
+  字符数估算，而不是精确计数（见[上下文管理](/docs/engineering/context)）。
+- **`create()` 比 `stream()` 弱。** 它不支持工具调用之外的一些细节，
+  适合做「只要一段文字」的摘要，不适合跑带工具的请求。
+- **`reasoning_content` 是非标准字段。** OpenAI 官方协议里没有它，
+  各家兼容服务的支持程度也不一样。透传它是为了不丢失思维链，
+  但不能指望每家都实现。
+- **没有重试、没有限流、没有退避。** 官方 SDK 帮你做了这些，
+  手写的 `fetch` 不会。一次 429 就直接抛到上层。
+
+<Callout type="idea" title="什么时候该自己写适配层">
+  当你需要的差异是**协议级**的——消息结构不一样、工具调用形状不一样——
+  自己写一层薄适配比硬套别人的 SDK 更省心。但如果差异只是
+  「换个 baseURL」「换个模型名」，那用 SDK 提供的兼容模式就够了，
+  不要重复造轮子。我们这个适配层存在的意义，是 OpenAI 协议和 Anthropic
+  协议在工具调用上的结构差异确实不小。
+</Callout>
+
+## 小结
+
+- provider 抽象的价值是**把协议差异收敛到一个文件**，而不是消除差异
+- 以 Anthropic 协议做内层标准：用表达力更强的协议，适配时才是有损转换
+- `createClient()` 返回类型恒为 `Anthropic`，上层代码完全感知不到差异
+- 消息翻译的三个关键点：system 降级成消息、工具入参序列化、工具结果拆开
+- OpenAI 的工具调用按 `index` 分片下发，要用 `Map` 归堆再用 `+=` 拼接
+- `finish_reason` 必须翻译回 `stop_reason`，否则上层判断不了循环是否该结束
+- 手写 SSE 的坑：`TextDecoder` 要传 `{ stream: true }`，否则中文会乱码
+- 明确知道适配层的缺口，比假装它完整更有价值
+
+下一章进入工程化：系统提示词怎么写才真的能改变模型行为。

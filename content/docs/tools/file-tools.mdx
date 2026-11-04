@@ -1,0 +1,424 @@
+---
+title: 文件工具
+description: 文件读写工具的实现：行号输出、分段读取、精确替换，以及沙箱和读后写校验。
+---
+
+本章你会得到三个文件工具：能按行号分段读的 Read、能整体写入的 Write、以及只改一小处的 Edit，外加两道沙箱检查和一道「读后写」一致性校验。
+
+## Read：带行号的分段读取
+
+Read 的入参只有三个：路径，加上可选的 `offset` 和 `limit`。schema 怎么变成模型能读的东西，见[Schema 与注册表](/docs/tools/schema)。
+
+```ts title="src/tools/fs-tools.ts"
+const schema = z.object({
+  file_path: z.string().describe('要读取的文件的绝对路径或相对工作目录的路径'),
+  offset: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe('起始行号，从 1 开始。不填则从头读取'),
+  limit: z.number().int().min(1).optional().describe('最多读取多少行'),
+});
+```
+
+执行的完整流程：
+
+```ts title="src/tools/fs-tools.ts"
+  async execute(input, ctx) {
+    const filePath = resolvePath(ctx.cwd, input.file_path);
+
+    if (!(await isSafePath(ctx.cwd, filePath))) {
+      return { content: `拒绝读取工作目录之外的文件：${filePath}`, isError: true };
+    }
+
+    const raw = await readFileSafe(filePath);
+    const content = normalizeNewlines(raw);
+    const allLines = content.split('\n');
+
+    const start = (input.offset ?? 1) - 1;
+    const end = input.limit ? start + input.limit : allLines.length;
+    const selected = allLines.slice(start, end);
+
+    if (selected.length === 0) {
+      return {
+        content: `文件 ${input.file_path} 一共 ${allLines.length} 行，offset=${input.offset ?? 1} 超出范围。`,
+        isError: true,
+      };
+    }
+
+    // 记录指纹，供 Edit 工具做「读后再改」检查
+    ctx.fileReads.markRead(filePath, await fingerprint(content));
+
+    const body = selected
+      .map((line, index) => `${String(start + index + 1).padStart(6)}\t${line}`)
+      .join('\n');
+
+    const truncated = end < allLines.length;
+    const suffix = truncated
+      ? `\n\n[文件共有 ${allLines.length} 行，已读取到第 ${end} 行]`
+      : '';
+
+    return { content: body + suffix };
+  },
+```
+
+几个设计点：
+
+- **行号是给模型看的。** 每行前面补上右对齐、行宽 6 的行号，模型就能直接说「第 42 行有问题」，你也能照着行号去看。行号用 `padStart(6)` 对齐，是为了让模型对行数的估计更稳定。
+- **行号是真实行号，不是片段内的序号。** `start + index + 1` 里的 `start` 是相对文件的偏移，所以读第 100 行开始的一段，行号依然从 100 开始。
+- **截断靠 `offset` / `limit`，不靠字符数。** Read 本身不截断文本，它控制的是「读多少行」，并在没读完时补一句 `[文件共有 N 行，已读取到第 M 行]`，让模型知道还有下文、可以接着读。真正的字符级截断是 `fs-utils.ts` 里的 `truncate()`，Grep 和 Bash 在用。
+- **读取时就记指纹。** `ctx.fileReads.markRead(...)` 在返回内容之前执行，这个指纹就是后面 Edit 做一致性校验的凭据。
+
+测试用例验证的就是行号这件事：
+
+```ts title="test/tools.test.ts"
+test('Read 能读取文件并返回带行号的内容', async () => {
+  await withSandbox(async (cwd) => {
+    await fs.writeFile(path.join(cwd, 'a.txt'), 'line1\nline2\nline3\n');
+
+    const result = await registry.get('Read')!.execute(
+      { file_path: 'a.txt' },
+      makeContext(cwd),
+    );
+
+    assert.match(result.content, /1\tline1/);
+    assert.match(result.content, /3\tline3/);
+  });
+});
+```
+
+## Write：创建、覆盖、统一换行
+
+Write 只做两件事：创建或整体覆盖。父目录不存在会自动建。
+
+```ts title="src/tools/fs-tools.ts"
+  async execute(input, ctx) {
+    const filePath = resolvePath(ctx.cwd, input.file_path);
+
+    if (!(await isSafePath(ctx.cwd, filePath))) {
+      return { content: `拒绝写入工作目录之外的文件：${filePath}`, isError: true };
+    }
+
+    const content = normalizeNewlines(input.content);
+    const existed = await fs
+      .stat(filePath)
+      .then(() => true)
+      .catch(() => false);
+
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, content, 'utf8');
+
+    ctx.fileReads.markRead(filePath, await fingerprint(content));
+
+    const lines = content.split('\n').length;
+    return {
+      content: `${existed ? '已覆盖' : '已创建'} ${input.file_path}（${lines} 行，${content.length} 字符）。`,
+    };
+  },
+```
+
+三个细节：
+
+- **`mkdir(..., { recursive: true })` 建父目录。** 模型经常直接写 `src/components/Foo.tsx`，中间目录还不存在。没有这一句，这个调用会直接失败。
+- **换行统一成 LF。** 写进去之前先把 CRLF 换成 LF，避免模型生成的内容在 Windows 和 macOS 之间产生「看不见的差异」——那种差异会让下一次 Edit 的 `old_string` 匹配失败。
+- **返回「已创建」还是「已覆盖」。** 模型需要知道自己是在新建文件还是在改别人的文件，措辞直接影响它下一步的动作。
+
+Write 之后也会 `markRead`，因为写入的内容和磁盘上的文件内容完全一致，指纹理应是同步的。
+
+建父目录这件事有对应的测试：
+
+```ts title="test/tools.test.ts"
+test('Write 创建文件并建立父目录', async () => {
+  await withSandbox(async (cwd) => {
+    const result = await registry.get('Write')!.execute(
+      { file_path: 'nested/dir/new.txt', content: 'hello' },
+      makeContext(cwd),
+    );
+
+    assert.ok(!result.isError, result.content);
+    assert.equal(await fs.readFile(path.join(cwd, 'nested/dir/new.txt'), 'utf8'), 'hello');
+  });
+});
+```
+
+注意测试里直接写了两级不存在的父目录 `nested/dir/`——如果没有那句 `mkdir(..., { recursive: true })`，这个调用会直接失败。
+
+## Edit：精确替换与唯一性约束
+
+Edit 只替换一段精确文本，不重写整个文件。沙箱检查和 Read、Write 完全一样，只是拒绝时的措辞不同：
+
+```ts title="src/tools/fs-tools.ts"
+    if (!(await isSafePath(ctx.cwd, filePath))) {
+      return { content: `拒绝编辑工作目录之外的文件：${filePath}`, isError: true };
+    }
+
+    const original = normalizeNewlines(await readFileSafe(filePath));
+
+    if (!original.includes(input.old_string)) {
+      return {
+        content: `未找到要替换的内容。请确认 old_string 与文件中的内容逐字符一致。文件路径：${input.file_path}`,
+        isError: true,
+      };
+    }
+
+    const occurrences = original.split(input.old_string).length - 1;
+    if (occurrences > 1 && !input.replace_all) {
+      return {
+        content:
+          `old_string 在 ${input.file_path} 中出现了 ${occurrences} 次，无法确定改哪一处。` +
+          '请提供更长的唯一片段，或者设置 replace_all=true。',
+        isError: true,
+      };
+    }
+```
+
+唯一性约束是 Edit 的核心：**`old_string` 必须在文件里唯一出现**（除非 `replace_all` 为 `true`）。不唯一时工具不猜，而是报错让模型自己细化——通常的做法是把 `old_string` 写得更长，带上上下文。
+
+对应的测试用例：
+
+```ts title="test/tools.test.ts"
+test('Edit 在 old_string 不唯一时拒绝执行', async () => {
+  await withSandbox(async (cwd) => {
+    await fs.writeFile(path.join(cwd, 'c.ts'), 'x\nx\n');
+
+    const result = await registry.get('Edit')!.execute(
+      { file_path: 'c.ts', old_string: 'x', new_string: 'y' },
+      makeContext(cwd),
+    );
+
+    assert.equal(result.isError, true);
+    assert.match(result.content, /出现了 2 次/);
+  });
+});
+```
+
+为什么必须这么严格？因为「找到第一处就替换」在真实代码里几乎总是错的。文件里出现两次 `return null;` 时，改错了地方不会报错，测试也未必覆盖得到——模型会拿到一个「执行成功」的假象。**报错让它重试，成本远低于静默改错地方。**
+
+成功路径上，文件内容和指纹都会同步更新：
+
+```ts title="test/tools.test.ts"
+test('Edit 替换成功且会标记文件已读', async () => {
+  await withSandbox(async (cwd) => {
+    const file = path.join(cwd, 'b.ts');
+    await fs.writeFile(file, 'const a = 1;\nconst b = 2;\n');
+
+    const ctx = makeContext(cwd);
+    const result = await registry.get('Edit')!.execute(
+      { file_path: 'b.ts', old_string: 'const a = 1;', new_string: 'const a = 42;' },
+      ctx,
+    );
+
+    assert.ok(!result.isError, result.content);
+    assert.match(await fs.readFile(file, 'utf8'), /const a = 42;/);
+  });
+});
+```
+
+## 读后写一致性检查
+
+这是 Edit 里最容易被忽略、但最能减少幻觉的一段：
+
+```ts title="src/tools/fs-tools.ts"
+    // 读-改-写一致性检查：模型可能基于过期的文件内容做修改
+    if (ctx.fileReads.wasRead(filePath)) {
+      const current = await fingerprint(original);
+      if (ctx.fileReads.hasChanged(filePath, current)) {
+        return {
+          content:
+            `文件 ${input.file_path} 在你上次读取之后发生了变化。请重新读取该文件，再进行修改。`,
+          isError: true,
+        };
+      }
+    }
+
+    const updated = input.replace_all
+      ? original.split(input.old_string).join(input.new_string)
+      : original.replace(input.old_string, input.new_string);
+
+    await fs.writeFile(filePath, updated, 'utf8');
+    ctx.fileReads.markRead(filePath, await fingerprint(updated));
+```
+
+它解决的问题很具体：模型在第 3 轮对话读过一次 `app.ts`，到第 15 轮时才决定改它。这中间可能发生过——格式化工具重排了 import、构建脚本生成了文件、你自己在编辑器里改了内容。此时模型手里的 `old_string` 是**过期的**，基于它做替换，得到的不是模型以为的那个结果。
+
+指纹机制很简单：
+
+```ts title="src/tools/fs-utils.ts"
+export async function fingerprint(content: string): Promise<string> {
+  return createHash('sha256').update(content).digest('hex').slice(0, 16);
+}
+```
+
+```ts title="src/tools/fs-utils.ts"
+export class FileReadTrackerImpl {
+  readonly #records = new Map<string, FileReadRecord>();
+
+  markRead(filePath: string, fileFingerprint: string): void {
+    this.#records.set(filePath, { fingerprint: fileFingerprint, readAt: Date.now() });
+  }
+
+  wasRead(filePath: string): boolean {
+    return this.#records.has(filePath);
+  }
+
+  hasChanged(filePath: string, fileFingerprint: string): boolean {
+    const record = this.#records.get(filePath);
+    if (!record) return true;
+    return record.fingerprint !== fileFingerprint;
+  }
+}
+```
+
+读文件时记下指纹，编辑前重新算一遍当前文件的指纹，两者不一致就拒绝。
+
+注意检查被 `wasRead(filePath)` 包着：**模型从没读过的文件，Edit 仍然允许执行**。因为此时 `old_string` 的唯一性检查本身就是一道保护——它能改对，说明内容确实匹配。指纹检查补的是「读过了、但内容变了」这一种情况。
+
+另外注意 Edit 成功后也会 `markRead`，把新内容的指纹写回去，这样连续多次编辑不会自己把自己拦住。
+
+## 沙箱：两道检查，`isInside` 和 `isSafePath`
+
+三个工具的第一步都一样：把路径解析成绝对路径，然后判断有没有越界。这个判断分两道。
+
+第一道是词法检查，看路径**字符串**在不在根目录里：
+
+```ts title="src/tools/fs-utils.ts"
+export function resolvePath(cwd: string, target: string): string {
+  return path.isAbsolute(target) ? path.normalize(target) : path.resolve(cwd, target);
+}
+```
+
+```ts title="src/tools/fs-utils.ts"
+export function isInside(root: string, target: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+```
+
+**为什么不能用 `startsWith`？** 假设工作目录是 `/home/user`，要访问的路径是 `/home/user-2/secret.txt`。字符串比较的结果是 `'/home/user-2/secret.txt'.startsWith('/home/user')` 为 `true`——**越界反而被判定成合法**。这是一个前缀匹配漏洞，在真实机器上意味着能读到同级的其他用户目录。
+
+`path.relative` 返回的是**相对路径**，判断就干净多了：
+
+- 目标在目录内部时，相对路径是 `src/app.ts`，不以 `..` 开头，也不是绝对路径。
+- 目标在目录外部时，相对路径是 `../user-2/secret.txt`，以 `..` 开头。
+- 目标在**另一个盘/根**上时，相对路径仍然是一个绝对路径（`path.isAbsolute` 为 `true`），所以要额外判一次。
+
+三个条件合起来：相对路径为空（就是目录本身）算在里面，不以 `..` 开头、也不是绝对路径才算在里面。
+
+对应的测试：
+
+```ts title="test/tools.test.ts"
+test('Read 拒绝读取工作目录之外的文件', async () => {
+  await withSandbox(async (cwd) => {
+    const result = await registry.get('Read')!.execute(
+      { file_path: '../../etc/passwd' },
+      makeContext(cwd),
+    );
+
+    assert.equal(result.isError, true);
+    assert.match(result.content, /拒绝读取/);
+  });
+});
+```
+
+## 第二道：符号链接能骗过字符串检查
+
+`isInside` 只看字符串，它看不见文件系统。一个具体的绕过例子：
+
+```bash
+cd /work/project
+ln -s /etc leak
+```
+
+现在工作目录里多了一个符号链接 `leak`，指向 `/etc`。模型请求读取 `leak/passwd`：
+
+- `resolvePath` 把它解析成 `/work/project/leak/passwd`。
+- `isInside('/work/project', '/work/project/leak/passwd')` 算出的相对路径是 `leak/passwd`，不以 `..` 开头——**判定为「在工作目录内」**。
+- 但操作系统解析这个路径时会顺着 `leak` 走进 `/etc`，真正读到的是 `/etc/passwd`。
+
+只判路径字符串的沙箱在这里就漏了：模型永远不需要拼 `../../etc/passwd`，只要工作目录里碰巧有个指向外面的链接就够了。真实项目里这种链接很常见——`node_modules/.bin` 是链接、monorepo 里的 `packages/app` 常被软链到仓库外的目录、用户随手 `ln -s` 一个大目录进来。
+
+所以第二道检查要真的去问文件系统：这条路径上**有没有任何一段是符号链接**。
+
+```ts title="src/tools/fs-utils.ts"
+/** 拒绝路径中任何符号链接，包括尚未创建的目标的已有父目录。 */
+export async function isSafePath(root: string, target: string): Promise<boolean> {
+  if (!isInside(root, target)) return false;
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  let current = path.resolve(root);
+  for (const part of relative.split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    try {
+      if ((await fs.lstat(current)).isSymbolicLink()) return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      throw error;
+    }
+  }
+  return true;
+}
+```
+
+逐段拆开看：
+
+- **先跑 `isInside`。** 词法检查是前提，`isSafePath` 是加码，不是替代品。路径根本不在根目录里，直接就拒了。
+- **逐段 `lstat`。** 把相对路径按分隔符切成一段一段，每拼出一段就 `lstat` 一次。`lstat` 不跟随符号链接——它问的是「这一项本身是不是链接」，而不是「这一项指向哪里」。
+- **碰到链接立刻返回 `false`。** 不管链接指向的是工作目录内部还是外部，一律拒绝。理由是链接可以被随时改指向，允许它等于把判定权交给文件系统。
+- **`ENOENT` 直接放行。** 目标还没创建是 Write 的正常场景。它下面的路径也不可能存在符号链接，所以剩下的段不用查了。
+
+于是 Read、Write、Edit 三个工具的第一步都变成了：
+
+```ts title="src/tools/fs-tools.ts"
+    if (!(await isSafePath(ctx.cwd, filePath))) {
+      return { content: `拒绝读取工作目录之外的文件：${filePath}`, isError: true };
+    }
+```
+
+Glob 和 Grep 的搜索入口用的也是同一个 `isSafePath`，见[搜索工具](/docs/tools/search-tools)。
+
+对应的测试把这条路径钉住了：
+
+```ts title="test/tools.test.ts"
+test('文件和搜索工具拒绝通过符号链接访问工作目录之外', async () => {
+  await withSandbox(async (cwd) => {
+    await withSandbox(async (outside) => {
+      await fs.writeFile(path.join(outside, 'secret.txt'), 'secret');
+      await fs.symlink(outside, path.join(cwd, 'link'));
+      const ctx = makeContext(cwd);
+      for (const [name, input] of [
+        ['Read', { file_path: 'link/secret.txt' }],
+        ['Write', { file_path: 'link/new.txt', content: 'bad' }],
+        ['Edit', { file_path: 'link/secret.txt', old_string: 'secret', new_string: 'bad' }],
+        ['Glob', { path: 'link', pattern: '**/*' }],
+        ['Grep', { path: 'link', pattern: 'secret' }],
+      ] as const) {
+        assert.equal((await registry.get(name)!.execute(input, ctx)).isError, true, name);
+      }
+      assert.equal(await fs.readFile(path.join(outside, 'secret.txt'), 'utf8'), 'secret');
+      await assert.rejects(fs.stat(path.join(outside, 'new.txt')));
+    });
+  });
+});
+```
+
+最后两行断言是重点：既要求工具报错，又要求**目标文件真的没被动过**——写操作不能在报错的同时已经把文件写到工作目录外面去了。
+
+注意越界时返回的是 `{ content: ..., isError: true }` 而不是抛异常。工具失败要以**结果**的形式回传给模型，让模型知道自己没读到文件、并决定换一条路（换成工作目录内的相对路径），而不是让整个 agent 崩掉。
+
+<Callout type="warn" title="这是路径级防线，不是操作系统级隔离">
+  `isSafePath` 解决的是「路径看起来在目录内，实际却指向外面」这一类问题，
+  但它挡不住范围内的破坏性操作——写一个 10GB 的文件、删掉整个目录，
+  都是范围内的合法路径。真正拦住危险操作的是权限层：`Write` 和 `Edit`
+  的默认权限是 `ask`，要你点头才执行，规则细节见[权限模型](/docs/engineering/permissions)。
+  另外，`lstat` 检查和随后的 `readFile` 之间存在竞态窗口，
+  严格隔离还得靠容器、chroot 或 OS 级权限，这一层我们没有做。
+</Callout>
+
+## 小结
+
+- Read 输出带行号的文本，用 `offset` / `limit` 分段读取，并在没读完时给出提示。
+- Write 自动建父目录、统一 LF 换行，并明确告诉模型是创建还是覆盖。
+- Edit 要求 `old_string` 唯一，不唯一就报错让模型细化，而不是猜一个地方改。
+- 读后写一致性检查用文件指纹拦住「基于过期内容」的修改，这是减少改错地方幻觉的关键一道。
+- 沙箱有两道：`isInside` 用 `path.relative` 判断包含关系（`startsWith` 会把 `/home/user-2` 误判成在 `/home/user` 内部），`isSafePath` 再逐段 `lstat`，拒绝路径链条上的任何符号链接。
+- 只判路径字符串的话，工作目录里一个 `ln -s /etc leak` 就能让 `leak/passwd` 绕过沙箱——这是第二道检查存在的全部理由。

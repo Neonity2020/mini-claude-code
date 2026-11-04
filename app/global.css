@@ -1,0 +1,75 @@
+@import 'tailwindcss';
+@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/preset.css';
+
+@theme {
+  /* 中英文混排时优先使用系统字体，避免构建期拉取 web font */
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'Courier New',
+    monospace;
+}
+
+/* 品牌配色：取自 Claude 的暖陶土色 */
+:root {
+  --color-fd-primary: oklch(0.62 0.145 42);
+  --color-fd-primary-foreground: oklch(0.99 0.005 60);
+  --color-fd-ring: oklch(0.62 0.145 42);
+  --color-fd-background: oklch(0.99 0.003 60);
+  --color-fd-card: oklch(0.975 0.004 60);
+}
+
+.dark {
+  --color-fd-primary: oklch(0.74 0.13 48);
+  --color-fd-primary-foreground: oklch(0.16 0.02 45);
+  --color-fd-ring: oklch(0.74 0.13 48);
+  --color-fd-background: oklch(0.16 0.012 45);
+  --color-fd-card: oklch(0.2 0.014 45);
+}
+
+html {
+  scrollbar-gutter: stable;
+}
+
+html > body[data-scroll-locked] {
+  margin-right: 0px !important;
+  --removed-body-scroll-bar-size: 0px !important;
+}
+
+/* 教程首页的品牌渐变标题 */
+.mcc-gradient {
+  background-image: linear-gradient(
+    120deg,
+    oklch(0.62 0.145 42) 0%,
+    oklch(0.58 0.16 300) 50%,
+    oklch(0.6 0.13 220) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* 终端风格的内容块 */
+.mcc-terminal {
+  border-radius: 0.75rem;
+  border: 1px solid var(--color-fd-border);
+  background: oklch(0.18 0.012 45);
+  overflow: hidden;
+}
+
+.mcc-terminal-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.875rem;
+  border-bottom: 1px solid oklch(0.3 0.012 45);
+  background: oklch(0.22 0.014 45);
+}
+
+.mcc-dot {
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: 9999px;
+}

@@ -1,0 +1,295 @@
+---
+title: 项目记忆
+description: 用 CLAUDE.md 固定项目约定，让 agent 每次进仓库就知道怎么干活。
+---
+
+本章我们要**新写一个模块**：`examples/mini-claude-code/` 里还没有项目记忆的实现，这章从零写出来。做完你会得到一个自动读取 `CLAUDE.md` 的加载器和一份落地清单。
+
+## 概念：三层记忆
+
+一个 coding agent 能「记住」的东西分三层，作用域和生命周期都不一样：
+
+| 层 | 载体 | 生命周期 | 谁维护 |
+| --- | --- | --- | --- |
+| 系统提示词（system prompt） | `src/prompt.ts` 里的 `SYSTEM_PROMPT` | 跟程序走，发版才变 | 工具作者 |
+| 项目记忆（project memory） | 仓库根目录的 `CLAUDE.md` | 跟仓库走，提交进 git | 项目成员 |
+| 会话历史（conversation history） | 内存里的 `MessageParam[]` | 跟会话走，`/clear` 就没了 | 系统自动 |
+
+系统提示词说「怎么当编程助手」，项目记忆说「在这个仓库怎么干活」，会话历史是这次任务进展。
+
+两者的分工是「通用 vs 具体」。系统提示词不该写「这个项目用 pnpm」，那是项目记忆的活；项目记忆也不该写「回答用中文」，那是系统提示词的活。混在一起：记忆被别的项目复用时带着无关约束，系统提示词则因为塞了具体细节而没法通用。
+
+<Callout type="idea" title="项目记忆是给 agent 的 onboarding 文档，不是给人看的 README">
+  README 写给人看：项目是什么、怎么装、怎么用、有什么功能。
+  项目记忆写给 agent 看：这个仓库里**哪些决定不需要 agent 再做一遍**。
+
+  区别很具体。README 里写「本项目支持 Node 20+」，agent 读完不知道该用 `pnpm` 还是 `npm`；项目记忆里写「用 pnpm，不要用 npm」，agent 立刻知道敲什么。
+
+  判断标准很简单：删掉它 agent 大概率会做错事，就该写进项目记忆；否则那属于 README。
+</Callout>
+
+## 什么时候加载
+
+项目记忆只在**会话开始时**读一次，然后拼进系统提示词（或作为首条上下文消息）。每轮都读文件是浪费——会话里文件基本不变。
+
+两种注入方式：
+
+**方式一：拼进系统提示词**（本章采用）
+
+系统提示词随每次请求一起发，放在 `system` 字段里。模型会把它的内容当成「行为准则」而不是「用户的话」，遵守率更高；而且它不占用消息历史，不会触发上下文压缩。
+
+**方式二：作为首条上下文消息**
+
+另一种做法是作为首条上下文消息注入，适合内容很多、需要区分「背景信息」和「用户新指令」的场合。代价是占用消息预算，被压缩时可能摘要掉。
+
+## 实现：记忆加载器
+
+新建 `examples/mini-claude-code/src/memory/loader.ts`：
+
+```ts title="src/memory/loader.ts（本章新增）"
+import fs from 'node:fs/promises';
+import path from 'node:path';
+
+/** 项目记忆文件名，按优先级从高到低查找 */
+const MEMORY_FILES = ['CLAUDE.md', 'AGENTS.md'];
+
+/** 单个记忆文件的上限，防止一个巨大的文件把上下文吃光 */
+const MAX_MEMORY_CHARS = 8_000;
+
+export interface ProjectMemory {
+  /** 命中的记忆文件路径，没找到时为 null */
+  path: string | null;
+  /** 文件正文 */
+  content: string;
+  /** 是否因为超长被截断 */
+  truncated: boolean;
+}
+
+/**
+ * 读取项目记忆。
+ *
+ * 从工作目录开始往上逐级查找：先找 CLAUDE.md，再找 AGENTS.md。
+ * 越靠近当前目录的约定越具体，所以先找到的优先。
+ */
+export async function loadProjectMemory(cwd: string): Promise<ProjectMemory> {
+  let dir = path.resolve(cwd);
+
+  for (;;) {
+    for (const name of MEMORY_FILES) {
+      const found = await readIfExists(path.join(dir, name));
+      if (found) {
+        return { path: path.join(dir, name), content: found.content, truncated: found.truncated };
+      }
+    }
+
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  return { path: null, content: '', truncated: false };
+}
+
+async function readIfExists(
+  file: string,
+): Promise<{ content: string; truncated: boolean } | null> {
+  try {
+    const raw = await fs.readFile(file, 'utf8');
+    if (raw.length <= MAX_MEMORY_CHARS) {
+      return { content: raw, truncated: false };
+    }
+    return { content: raw.slice(0, MAX_MEMORY_CHARS), truncated: true };
+  } catch {
+    return null;
+  }
+}
+```
+
+三个设计点：
+
+**逐级向上查找**。`cd examples/mini-claude-code` 时，agent 读它的 `CLAUDE.md`；没有就往上找仓库根目录的。子目录的约定更具体，优先于父目录。
+
+**两个文件名**。`CLAUDE.md` 是 Claude Code 的约定，`AGENTS.md` 是更通用的名字（[agents.md](https://agents.md) 规范）。两个都支持就不踩空。
+
+**截断上限**。`MAX_MEMORY_CHARS` 是必需的：项目记忆要塞进上下文窗口，一份十万字符的「记忆」会把预算吃光。超了要截断，并把 `truncated` 传出去让上层提示用户。
+
+接着把它拼进系统提示词，还是同一个文件：
+
+```ts title="src/memory/loader.ts（本章新增）"
+/**
+ * 把项目记忆拼到系统提示词末尾。
+ *
+ * 放末尾而不是开头：系统提示词整体位于对话历史之前，
+ * 末尾的内容离对话更近，读起来更像「针对当前这个仓库的补充」，
+ * 而不是「泛泛的行为原则」。
+ */
+export function buildSystemPrompt(base: string, memory: ProjectMemory): string {
+  if (!memory.path) return base;
+
+  return [
+    base,
+    '',
+    `项目记忆（来自 ${path.basename(memory.path)}）：`,
+    '以下是本项目的约定，请严格遵守。如果记忆里的内容与用户的当前指令冲突，以用户为准。',
+    '',
+    memory.content,
+  ].join('\n');
+}
+```
+
+那句「如果记忆里的内容与用户的当前指令冲突，以用户为准」值得单独说：记忆是**长期约定**，用户的话是**当下意图**，冲突时用户永远是对的。没有这句，模型可能拿陈旧约定否决用户的临时要求。
+
+最后把它接进入口。下面是 `src/index.ts` 需要**新增**的片段——`src/memory/loader.ts` 和这里的改动现在都还不存在，要你照着写出来：
+
+```ts title="src/index.ts（本章新增示例）"
+import { loadProjectMemory, buildSystemPrompt } from './memory/loader.js';
+
+// ... 创建 client、tools、permissions、contextManager 之后：
+
+const memory = await loadProjectMemory(cwd);
+const systemPrompt = buildSystemPrompt(SYSTEM_PROMPT, memory);
+
+// ... 创建 Agent 时把 systemPrompt 传进去：
+
+const agent = new Agent({
+  client,
+  tools,
+  permissions,
+  contextManager,
+  systemPrompt,
+  model,
+  cwd,
+  // ...
+});
+```
+
+`Agent` 这一行都不用改——它本来就接收 `systemPrompt` 字符串（见 [Agent 循环](/docs/core/agent-loop)）。把系统提示词做成纯字符串的好处就是：注入点只有一个。
+
+真实的入口文件里 Agent 是由一个 `makeAgent()` 工厂创建的（`/clear` 命令会丢掉旧会话、重建一个 Agent）。所以记忆要在工厂**外面**读一次，读完拼好 `systemPrompt`，由工厂每次复用同一个字符串：
+
+```ts title="src/index.ts（本章新增示例）"
+// ... 先读一次记忆：
+
+const memory = await loadProjectMemory(cwd);
+const systemPrompt = buildSystemPrompt(SYSTEM_PROMPT, memory);
+
+// ... 再建 Agent，工厂每次都复用同一份 systemPrompt：
+
+const makeAgent = () => new Agent({
+  client, tools, permissions, contextManager, systemPrompt, model, cwd,
+  // ...
+});
+```
+
+一个已知限制：会话开始后就不再重读，中途改 `CLAUDE.md` agent 不知道。Mini Claude Code 选了简单版：启动时读一次。
+
+## 怎么写好项目记忆
+
+### 写约定，不写教程
+
+好的项目记忆是**可执行的约束**，不是知识介绍。
+
+反例：
+
+```text
+本项目是一个用 TypeScript 实现的命令行 AI 助手。
+它支持文件读写、搜索、命令执行等功能。
+代码结构清晰，采用了模块化设计。
+```
+
+这几句话对 agent 没用——从目录结构里就能看出来。换成约定：
+
+```text
+用 pnpm，不要用 npm 或 yarn。
+新工具放在 src/tools/ 下，一个工具一个文件。
+新工具必须在 src/tools/index.ts 的 BUILTIN_TOOLS 里注册，否则模型看不到它。
+```
+
+三句都能省掉 agent 的一次试错。像「测试跑 `pnpm test`」这种可验证的命令也一样——比「记得跑测试」有用一百倍：前者照着敲就行，后者要靠它猜。
+
+### 写「禁止事项」
+
+反直觉但重要：**否定式约束比肯定式约束更值得写**。
+
+agent 天然倾向于「多改一点」——加个依赖、改个接口、顺手重构一下。你不写禁令，它就不知道这些是禁区。而「禁止事项」是模型会主动遵守的少数内容之一，它明确划出了一条不越界的线。
+
+```text
+禁止事项：
+- 不要引入新的运行时依赖，目前只有 @anthropic-ai/sdk 和 zod。
+- 不要修改 src/tools/types.ts 里的 Tool 接口，除非同步更新所有工具。
+- 不要执行 git commit 和 git push，除非我明确要求。
+```
+
+### 控制长度
+
+项目记忆和系统提示词抢同一份预算：放进系统提示词就等于每轮重读一遍。几百行以内的 CLAUDE.md 是合适的，再长就该拆成多份文件让 agent 按需读取。
+
+## 一份真实的 CLAUDE.md
+
+给 `examples/mini-claude-code/` 写一份：
+
+```text title="CLAUDE.md"
+# CLAUDE.md
+
+给在这个仓库里工作的 AI 助手看的项目约定。
+
+## 包管理器
+
+- 用 pnpm。不要用 npm 或 yarn，也不要生成 package-lock.json / yarn.lock。
+- 装依赖 `pnpm install`，加依赖 `pnpm add <包>`，加开发依赖 `pnpm add -D <包>`。
+
+## 常用命令
+
+- 类型检查：`pnpm typecheck`
+- 构建：`pnpm build`
+- 测试：`pnpm test`
+
+## 目录约定
+
+- `src/` 是全部源码，按职责分文件：agent 循环、权限、上下文、提示词各占一个文件。
+- `src/tools/` 放工具实现，一个工具一个文件，导出一个符合 `Tool` 接口的对象。
+- `src/tools/types.ts` 存放所有工具共享的类型。改它要同步改所有工具。
+- 新工具必须在 `src/tools/index.ts` 的 `BUILTIN_TOOLS` 数组里注册，否则模型看不到它。
+- `test/` 放测试，用 Node 内置的 `node:test`，一个文件对应一个主题。
+
+## 代码约定
+
+- 用 ESM，所有相对导入带 `.js` 后缀。
+- 面向用户的文案用中文，标识符和注释里的专有名词用英文。
+- 不要改动 `src/prompt.ts` 里的系统提示词，除非任务明确要求。
+
+## 禁止事项
+
+- 不要引入新的运行时依赖，目前只有 `@anthropic-ai/sdk` 和 `zod`。
+- 不要执行 `git commit`、`git push` 或任何改写历史的命令，除非我明确要求。
+- 不要修改 `src/tools/types.ts` 里的 `Tool` 接口，除非同步更新所有工具实现。
+- 不要删除或覆盖整个文件；改动优先用精确替换。
+```
+
+关于 `pnpm test`：记忆里的这条约定，靠的是仓库里真实存在的脚本来兑现——
+
+```json title="examples/mini-claude-code/package.json"
+{
+  "scripts": {
+    "test": "node --import tsx --test test/tools.test.ts"
+  }
+}
+```
+
+这正好说明项目记忆的一个特点：**它描述的是「应该怎样」，怎么落地是仓库自己的事**。记忆写 `pnpm test`，它跑什么由 `package.json` 说了算。两者对得上，agent 照着执行；写一个不存在的命令，agent 就会卡在「command not found」上。
+
+<Callout type="warn" title="项目记忆会过期">
+  项目记忆写进 git，就跟着代码一起演化——这是它最大的优点（改代码的人自然会更新它），也是最大的风险：**没人记得更新时，它就开始骗人**。
+
+  一条过期的约定比没有约定更糟：没有约定，agent 会问或者试错；有过期约定，agent 会自信地按错的方式执行。
+
+  缓解办法：把「不要做什么」写具体（「不要用 npm」这种不会过期的），少写容易变的内容；把约定和它在仓库里的落点写在一起，让 agent 能发现不一致。
+</Callout>
+
+## 小结
+
+- 记忆分三层：系统提示词（全局）、项目记忆（仓库级）、会话历史（本次会话），项目记忆负责具体约定。
+- 会话开始时读一次，拼进系统提示词末尾；仓库里的 CLAUDE.md 会被 agent 自动发现。
+- 本章新写的 `src/memory/loader.ts` 负责查找、读取、截断和拼接，`src/index.ts` 里加几行接进去。
+- 项目记忆写约定不写教程，重点写「禁止事项」和可验证的命令。
+- 记忆是给 agent 的 onboarding 文档，不是 README；标准是「删掉它，agent 会不会做错事」。

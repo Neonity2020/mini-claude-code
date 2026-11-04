@@ -1,0 +1,228 @@
+---
+title: 环境准备
+description: 装好依赖、拿到 API key、跑通测试，然后启动你的第一个编程助手。
+---
+
+本章你会得到一个能对话的终端 agent，并确认本地环境一切正常。
+
+## 你需要准备什么
+
+**会写 TypeScript 就行。** 知道 HTTP 请求、JSON、`async/await` 怎么用就足够。
+你不需要了解 AI，不需要读过 Claude Code 的源码，也不需要会配置模型。
+
+除此之外你需要：
+
+- **Node.js 20 或更高版本**，以及 **pnpm**
+- **一个 Anthropic 账户**，以及它签发的 API key
+- 一个终端（macOS、Linux、Windows 都可以）
+
+先确认前两项在位：
+
+```bash
+node -v
+pnpm -v
+```
+
+## 示例项目长什么样
+
+这一章你不需要读懂全部代码，先认个脸。后面每一章都会回来拆其中一层。
+
+<Files>
+  <Folder name="mini-claude-code" defaultOpen>
+    <Folder name="src" defaultOpen>
+      <File name="index.ts" />
+      <File name="agent.ts" />
+      <File name="llm.ts" />
+      <File name="prompt.ts" />
+      <File name="permissions.ts" />
+      <File name="context.ts" />
+      <File name="ui.ts" />
+      <Folder name="tools" defaultOpen>
+        <File name="types.ts" />
+        <File name="registry.ts" />
+        <File name="fs-utils.ts" />
+        <File name="fs-tools.ts" />
+        <File name="search-tools.ts" />
+        <File name="bash-tool.ts" />
+        <File name="index.ts" />
+      </Folder>
+    </Folder>
+    <Folder name="test" defaultOpen>
+      <File name="tools.test.ts" />
+    </Folder>
+    <File name="package.json" />
+    <File name="tsconfig.json" />
+    <File name="tsconfig.build.json" />
+  </Folder>
+</Files>
+
+每个文件负责一件事：
+
+| 文件 | 作用 |
+| --- | --- |
+| `src/index.ts` | CLI 入口：读用户输入、装好各个部件 |
+| `src/agent.ts` | agent 主循环：模型 → 工具 → 结果 → 模型 |
+| `src/llm.ts` | Anthropic 客户端与 token 估算 |
+| `src/prompt.ts` | 系统提示词（system prompt） |
+| `src/permissions.ts` | 权限规则：放行、询问、拒绝 |
+| `src/context.ts` | 上下文管理：窗口预算与历史压缩 |
+| `src/ui.ts` | 终端颜色与符号 |
+| `src/tools/types.ts` | 工具的类型契约 |
+| `src/tools/registry.ts` | 工具注册表：把工具翻译成模型看得懂的 JSON Schema |
+| `src/tools/fs-utils.ts` | 路径沙箱、读取追踪等文件基础设施 |
+| `src/tools/fs-tools.ts` | Read / Write / Edit |
+| `src/tools/search-tools.ts` | Glob / Grep |
+| `src/tools/bash-tool.ts` | Bash / TodoWrite |
+| `src/tools/index.ts` | 内置工具清单 |
+| `test/tools.test.ts` | 工具层测试 |
+| `tsconfig.json` | 类型检查配置 |
+| `tsconfig.build.json` | 构建配置（`pnpm build` 用） |
+
+<Callout type="info" title="为什么目录长这样">
+  一个 coding agent 的复杂度几乎全部来自「工具」和「循环」，所以 `src/tools/`
+  是整个项目最重的目录，`src/agent.ts` 反而很短。工具多一个，模型的选择就多
+  一分，工具少一个，行为立刻变——这是后面第 5 章要反复用到的实验手段。
+</Callout>
+
+## 动手
+
+<Steps>
+
+<Step title="拿到 API key">
+
+示例代码支持三家模型服务，用 `LLM_PROVIDER` 切换。**跟着本教程走，就选 Anthropic**：
+
+```bash
+export LLM_PROVIDER=anthropic
+```
+
+然后去 [platform.claude.com](https://platform.claude.com) 登录，在 API 控制台创建一个
+key（形如 `sk-ant-...`）。同时确认账户里有余额或已配置好计费方式。
+
+这个 key 代表你的身份，所有请求都由它发起，**费用计入你自己的账户**。
+
+<Callout type="info" title="另外两家怎么配">
+  代码默认的 provider 是 `mimo`（一家 OpenAI 兼容服务），不设
+  `LLM_PROVIDER` 时走的就是它：
+
+  ```bash
+  # OpenAI 兼容服务（默认）
+  export MIMO_API_KEY=tp-xxx
+
+  # OpenAI 官方
+  export LLM_PROVIDER=openai
+  export OPENAI_API_KEY=sk-xxx
+  ```
+
+  三家的模型名也各有自己的环境变量（`ANTHROPIC_MODEL` / `MIMO_MODEL` /
+  `OPENAI_MODEL`）。协议差异由适配层抹平，上层代码一行不用改——
+  细节见[多模型接入](/docs/core/providers)。
+</Callout>
+</Step>
+
+<Step title="安装依赖">
+
+进入示例目录：
+
+```bash
+cd examples/mini-claude-code
+pnpm install
+```
+
+这个目录有自己的 `package.json` 和 `pnpm-lock.yaml`，依赖只有两个运行时包
+（`@anthropic-ai/sdk` 和 `zod`）加三个开发依赖（`tsx`、`typescript`、`@types/node`）。
+
+</Step>
+
+<Step title="设置环境变量">
+
+```bash
+export LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=sk-ant-xxx
+```
+
+想换模型就再设一个 `ANTHROPIC_MODEL`，默认值见下一章：
+
+```bash
+export ANTHROPIC_MODEL=claude-sonnet-4-6
+```
+
+也可以把这些写进示例目录下的 `.env` 文件——代码会用 Node 内置的
+`process.loadEnvFile()` 读取它，**已经存在的环境变量优先级更高**，
+所以临时覆盖一个变量不需要动 `.env`。
+
+<Callout type="warn" title="两件要当心的事">
+  **一是费用。** agent 循环很容易在你没注意时多跑几轮，每一轮都是一次完整的
+  模型调用。动手前先看一眼 [Anthropic 定价](https://platform.claude.com/docs/en/about-claude/pricing)，
+  心里有个数再开始。
+
+  **二是别把 key 提交进 git。** 如果你想长期保存它，写进 `.env` 文件，
+  并且确认仓库根目录的 `.gitignore` 里包含 `.env`。
+</Callout>
+
+</Step>
+
+<Step title="跑一遍测试">
+
+这个项目的工具层有 15 个用例，覆盖路径沙箱、读后写校验、参数唯一性和错误标记：
+
+```bash
+node --import tsx --test test/tools.test.ts
+```
+
+全绿的话应该看到这样：
+
+```text
+ℹ tests 11
+ℹ pass 11
+ℹ fail 0
+```
+
+这一步不需要 API key——工具层是纯本地逻辑。如果这里就挂了，先别往下走，
+环境问题后面会变成很难查的 bug。
+</Step>
+
+<Step title="启动">
+
+```bash
+pnpm start
+```
+
+看到 REPL 提示符就成了：
+
+```text
+Mini Claude Code — 模型 claude-sonnet-4-6
+工作目录 /your/path/examples/mini-claude-code
+输入 /help 查看命令，/exit 退出。
+
+› 看看 src/agent.ts 里 agent 循环是怎么写的
+```
+
+</Step>
+
+</Steps>
+
+## 验证
+
+进 REPL 之后，用一句需要读文件的话试它：
+
+```text
+› src/agent.ts 里 run 方法是怎么写的？
+```
+
+它应该先调 Glob / Read 把文件读进来，再总结给你看。如果它张口就答、
+一次工具都不调，说明模型没拿到工具或者 API key 配错了——检查终端里有没有
+报错。
+
+`/help` 可以看到全部内置命令，`/exit` 退出。
+
+## 小结
+
+- 前置知识只要 TypeScript；AI 知识不需要。
+- API key 在 [platform.claude.com](https://platform.claude.com) 申请，费用计入你自己的账户。
+- `export LLM_PROVIDER=anthropic` 加 `export ANTHROPIC_API_KEY=sk-ant-xxx` 之后，
+  `node --import tsx --test test/tools.test.ts` 应该 18 个用例全过。
+- `pnpm start` 进入 REPL，`/help` 看命令，`/exit` 退出。
+- key 不要提交进仓库；用 `.env` 时确认它已被 `.gitignore` 忽略。
+
+下一章我们先不写代码，看看一个 coding agent 到底由哪些零件组成。

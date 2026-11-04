@@ -1,0 +1,336 @@
+---
+title: 上下文管理
+description: 给上下文窗口做预算，撑爆之前自动压缩历史，保留最近细节。
+---
+
+本章你会得到上下文管理器（context manager）：估算当前对话占了多少 token，快撑爆窗口时把早期历史压成摘要，并且保证压缩之后的消息历史依然合法。
+
+## 概念：上下文窗口就是 agent 的能力上限
+
+模型的上下文窗口（context window）是有限的：系统提示词、工具定义、全部历史消息，以及这一轮要吐出来的内容都得装在里面。装不下不是「慢一点」，而是**直接报错**。
+
+对 coding agent 来说，这比聊天机器人严重得多。一次「重构这个函数，顺便改测试」的任务，历史是这样的：
+
+1. 一句用户请求；
+2. 模型的思考 + 一次 `Glob` 调用；
+3. 一次 `Read` 的返回——假设文件 800 行；
+4. 模型的思考 + 一次 `Edit`；
+5. Edit 的返回，然后又是一轮 Read、Grep、Edit……
+
+每读一个大文件，历史就涨几千 token；跑一次测试又是几千。任务做到一半窗口就满了。
+
+<Callout type="warn" title="上下文窗口是 agent 的能力上限">
+  窗口大小直接决定 agent 能处理多长的任务。上下文满了只剩三个选择：压缩、丢弃、或者换个更大的模型。
+
+  没有压缩机制的话，第二轮对话开始，agent 就会开始「失忆」：看不见自己前面读过什么、改过什么，于是重复读文件、重复问同样的问题。长任务撞墙不是模型变笨，是窗口到顶了。
+</Callout>
+
+## 预算怎么算：估算 token 数
+
+要做预算，先得知道现在用了多少。精确做法是调 Anthropic 的 `count_tokens` 接口，但 Mini Claude Code 没这么做：
+
+```ts title="src/llm.ts"
+/**
+ * 粗略估算 token 数量。
+ *
+ * 真实 token 数可以用 count_tokens 接口精确查询，但那是异步的、
+ * 要额外一次网络请求，不适合放在每轮循环里做预算判断。
+ * 这里用「字符数 / 3.6」估算——英文文本的经验值，误差在 15% 以内，
+ * 对「该不该压缩」这种二值决策完全够用。
+ */
+export function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 3.6);
+}
+
+/** 估算一组消息的 token 数 */
+export function estimateMessagesTokens(
+  messages: unknown[],
+  system?: string,
+): number {
+  const serialized = JSON.stringify(messages);
+  return estimateTokens(serialized) + (system ? estimateTokens(system) : 0);
+}
+```
+
+为什么不用精确接口：每轮循环都要问一次「现在要不要压缩」，一次精确查询就是额外一次网络往返；而判断只要一个布尔值，误差 15% 完全无所谓。
+
+还有一个更实际的理由——`count_tokens` 是异步的，而 `needsCompaction()` 要在**请求模型之前**同步给出答案。
+
+`estimateMessagesTokens` 直接把消息数组 `JSON.stringify` 再算长度，是个保守估计：工具结果里的 JSON 结构会被算进字符数，实际 token 数通常更少。也就是说它会**提前**触发压缩，而不是拖到超限才发现。
+
+## 三个关键参数
+
+```ts title="src/context.ts"
+export interface ContextManagerOptions {
+  /** 上下文窗口大小 */
+  maxTokens: number;
+  /** 超过这个比例就触发压缩 */
+  compactThreshold: number;
+  /** 压缩时保留最近多少条消息不动 */
+  keepRecentMessages: number;
+  client?: Anthropic;
+  model?: string;
+}
+```
+
+<TypeTable
+  type={{
+    maxTokens: {
+      type: 'number',
+      required: true,
+      default: '200000',
+      description: '上下文窗口大小，作为预算基准',
+    },
+    compactThreshold: {
+      type: 'number',
+      required: true,
+      default: '0.7',
+      description: '占用超过窗口的这个比例就触发压缩。留 30% 余量给模型输出和工具结果',
+    },
+    keepRecentMessages: {
+      type: 'number',
+      required: true,
+      default: '10',
+      description: '压缩时保留最近多少条原始消息不动，只总结更早的部分',
+    },
+  }}
+/>
+
+真正生效的预算是两者的乘积：
+
+```ts title="src/context.ts"
+  /** 当前预算的 token 上限 */
+  get limit(): number {
+    return Math.floor(this.#options.maxTokens * this.#options.compactThreshold);
+  }
+
+  /** 估算当前上下文的 token 占用 */
+  estimate(messages: MessageParam[], system?: string): number {
+    return estimateMessagesTokens(messages, system);
+  }
+```
+
+`200_000 × 0.7 = 140_000` token。剩下 30% 是给这一轮的模型输出和工具结果留的余量——等到 100% 才压缩往往来不及。
+
+`keepRecentMessages` 默认 10 条也不是随便定的。一条工具往返至少占两条消息（`tool_use` + `tool_result`），10 条差不多覆盖最近 5 次工具调用，足够模型记住刚改的是哪个文件、参数是什么。
+
+## 压缩策略：老的总结成摘要，新的原样保留
+
+`compact()` 是整个机制的核心：
+
+```ts title="src/context.ts"
+  /**
+   * 压缩上下文。
+   *
+   * 策略：把较早的消息交给模型总结成一段摘要，
+   * 保留最近 N 条原始消息不动（保证近期的精确细节不丢失）。
+   */
+  async compact(messages: MessageParam[], system?: string): Promise<MessageParam[]> {
+    const keep = this.#options.keepRecentMessages;
+    if (messages.length <= keep) return messages;
+
+    let boundary = messages.length - keep;
+    // tool_result 必须紧跟包含对应 tool_use 的 assistant 消息。
+    const first = messages[boundary];
+    if (first?.role === 'user' && Array.isArray(first.content) &&
+        first.content.some((block) => block.type === 'tool_result')) boundary--;
+    const older = messages.slice(0, boundary);
+    const recent = messages.slice(boundary);
+
+    const summary = await this.#summarize(older);
+
+    const compacted: MessageParam[] = [
+      {
+        role: 'user',
+        content: `[上下文摘要] 以下是本次会话早期内容的摘要，请以此为准继续工作：\n\n${summary}`,
+      },
+      ...recent,
+    ];
+
+    return compacted;
+  }
+```
+
+拆开看是三步：**切分**（老的 `older` 要总结，新的 `recent` 原封不动）、**总结**（把老消息交给模型压成一段文字）、**重建**（用「一条摘要消息 + 最近 N 条原文」替换原消息）。
+
+「切分」这一步比看起来复杂：消息成对出现，切点切错位置就会得到一份**非法历史**。后面单独讲。
+
+摘要被包装成一条 `role: 'user'` 的消息，开头写明「以下是本次会话早期内容的摘要，请以此为准继续工作」。这句前缀很关键——它告诉模型这段文本是「过去的记录」而不是「用户的新指令」，否则模型可能把摘要里的一句话当成新要求。
+
+摘要由另一个模型调用生成，提示词里明确列出了要保留什么：
+
+```ts title="src/context.ts"
+    const response = await this.#options.client.messages.create({
+      model: this.#options.model,
+      max_tokens: 1_000,
+      system:
+        '你是一个会话压缩器。把给定的对话历史压缩成一份紧凑的摘要，' +
+        '保留：已完成的任务、关键决策、涉及的文件路径、尚未完成的事项、用户明确的偏好。' +
+        '丢弃寒暄和冗余过程描述。只输出摘要正文。',
+      messages: [
+        {
+          role: 'user',
+          content: `请压缩以下对话历史：\n\n${transcript.slice(0, 100_000)}`,
+        },
+      ],
+    });
+```
+
+「保留什么」比「压缩成什么样」有用得多。这份清单基本就是 coding agent 任务的信息骨架：做过什么、决定了什么、动了哪些文件、还剩什么。
+
+没有配置 `client` 和 `model` 时（离线测试），摘要会退化成截断：
+
+```ts title="src/context.ts"
+    // 没有客户端（离线测试）时，退化成截断
+    if (!this.#options.client || !this.#options.model) {
+      return transcript.slice(0, 4_000);
+    }
+```
+
+这不是完整的压缩路径（只是丢掉尾部），但它让 `ContextManager` 能在没有网络的环境里测。
+
+### 切分边界：不能把 `tool_use` 和 `tool_result` 拆散
+
+回到切分。Anthropic 的消息协议要求：模型请求调用工具的 `tool_use` 必须紧跟一条回传结果的 `tool_result`。历史里留下一条**没有对应 `tool_use` 的 `tool_result`**，API 会直接拒绝这次请求。
+
+按条数一刀切最容易切在工具调用中间。一轮工具往返在数组里是两条消息，`keepRecentMessages` 恰好是 1 时切点就落在中间：
+
+```
+assistant: [tool_use Read]      ← messages[0]
+user:      [tool_result ...]    ← messages[1]
+```
+
+不修这个 bug，压缩后剩下的历史就是一条孤儿 `tool_result`——它的 `tool_use` 已经被摘要吃掉了。历史非法，下一次请求会被 API 拒掉：压缩没省下 token，反而把会话卡死，而且报错隔了一层，很难查。
+
+所以切分前先挪一下切点：
+
+```ts title="src/context.ts"
+    let boundary = messages.length - keep;
+    // tool_result 必须紧跟包含对应 tool_use 的 assistant 消息。
+    const first = messages[boundary];
+    if (first?.role === 'user' && Array.isArray(first.content) &&
+        first.content.some((block) => block.type === 'tool_result')) boundary--;
+    const older = messages.slice(0, boundary);
+    const recent = messages.slice(boundary);
+```
+
+切点往前挪一条，那条 `tool_use` 就跟着留在 `recent` 里，配对重新完整。代价是最多保留 `keep + 1` 条。
+
+<Callout type="error" title="压缩不是纯文本处理，它得维护协议不变式">
+  「把老消息换成一段文字」看着像纯文本处理，实际上压缩要同时满足两件事：**语义上**别把关键细节丢了，**协议上**消息结构还得合法。
+
+  只顾语义不顾协议，症状是「压缩之后 agent 就废了」——压缩本身不报错，报错的是下一次请求。仓库里的测试 `上下文压缩保留完整的工具调用及结果` 盯的就是这条不变量：它用 `keepRecentMessages: 1` 构造出最容易切错的场景，断言压缩后末尾两条消息和压缩前完全一致。
+
+  也正因为压缩这么脆弱，把大段中间结果挪出主上下文（见 [子代理](/docs/advanced/subagents)）比指望压缩救场更彻底。
+</Callout>
+
+## 触发时机：在请求模型之前检查
+
+压缩不是独立的后台任务，而是每轮循环开头的一次检查，`Agent.run()` 的循环体第一件事就是它：
+
+```ts title="src/agent.ts"
+    for (let turn = 0; turn < maxTurns; turn++) {
+      await this.#maybeCompact();
+
+      const assistantMessage = await this.#callModel();
+    // ...
+    }
+```
+
+`#maybeCompact()` 做三步：判断需不需要压、压、替换。
+
+```ts title="src/agent.ts"
+  async #maybeCompact(): Promise<void> {
+    const manager = this.#options.contextManager;
+    if (!manager) return;
+    if (!manager.needsCompaction(this.#messages, this.#options.systemPrompt)) return;
+
+    const before = manager.estimate(this.#messages, this.#options.systemPrompt);
+    // 注意顺序：先压缩拿到新数组，再整体替换
+    const compacted = await manager.compact(this.#messages, this.#options.systemPrompt);
+    this.#messages.length = 0;
+    this.#messages.push(...compacted);
+    const after = manager.estimate(this.#messages, this.#options.systemPrompt);
+
+    this.#options.onToolStart?.(
+      '__log__',
+      `${paintIf('gray', `[上下文压缩] ${before} → ${after} tokens`)}`,
+    );
+  }
+```
+
+先压后替换的顺序不能反。反过来，`compact()` 拿到的 `messages` 是被清空的数组，摘要会是空的。
+
+判断条件在 `needsCompaction()` 里：
+
+```ts title="src/context.ts"
+  /** 是否需要压缩 */
+  needsCompaction(messages: MessageParam[], system?: string): boolean {
+    if (messages.length <= this.#options.keepRecentMessages) return false;
+    return this.estimate(messages, system) > this.limit;
+  }
+```
+
+第一条是短路条件：消息条数不超过 `keepRecentMessages` 就返回 false。刚开头的对话不会莫名其妙被压缩一次。
+
+顺便一提，系统提示词也计入预算（`estimate(messages, system)` 加了它），但它**不参与**压缩——`compact()` 只处理消息数组，系统提示词每次请求都原样带上。这也是它必须写得短：它是一份永久开销。
+
+## 手动压缩：`/compact`
+
+自动压缩只在「快满了」时才触发，但有时任务正卡在关键细节上——你想在继续之前先把早期历史收一收。`Agent` 为此暴露了一个公开方法：
+
+```ts title="src/agent.ts"
+  async compact(): Promise<boolean> {
+    const manager = this.#options.contextManager;
+    if (!manager || this.#messages.length <= 1) return false;
+    const compacted = await manager.compact(this.#messages, this.#options.systemPrompt);
+    if (compacted === this.#messages) return false;
+    this.#messages.splice(0, this.#messages.length, ...compacted);
+    return true;
+  }
+```
+
+返回 `boolean` 是因为「压没压」本身有信息量：消息条数不足 `keepRecentMessages` 时 `ContextManager.compact()` 会原样返回同一个数组，这时该告诉用户「当前会话无需压缩」，而不是假装压过了。
+
+入口是 `src/index.ts` 的 `/compact` 命令：
+
+```ts title="src/index.ts"
+      if (command === '/compact') {
+        compacting = true;
+        ui.setBusy(true);
+        void agent.compact().then((changed) => ui.add('system', changed ? '上下文已压缩。' : '当前会话无需压缩。'))
+          .catch((error: Error) => ui.add('error', error.message)).finally(() => { compacting = false; ui.setBusy(false); });
+        return;
+      }
+```
+
+压缩是一次额外的模型调用，可能要等上几秒，所以压缩期间用 `compacting` 标记锁住 `/compact`：此时按 Ctrl+C 只会提示「上下文压缩进行中，请稍候」，不会 `abort()` 掉正在进行的压缩。手动和自动压缩走的是同一个 `ContextManager`，上面讲的协议不变式两条路径都适用。
+
+## 压缩的代价：摘要会丢信息
+
+压缩不是无损的，这是必须承认的代价。
+
+摘要是一次有损的、有损程度不可控的转换。原始历史里可能有：
+
+- 一条被试过的命令和它的具体报错；
+- 模型自己排除掉的一个错误方向；
+- 用户随口提的一个偏好（「以后别用 npm」）。
+
+摘要会保留「做过什么、改了哪些文件」，但「试过 npm install 报 E404，改用 pnpm 成功」这种**过程细节**可能压成一句「安装了依赖」。对后续任务够用，但需要精确复现某个中间状态时就不够了。
+
+保留最近 N 条原文正是为了对冲这件事：**最近的交互保留原文，模型看到的是精确的接口和错误信息**；更早、更概览的内容才交给摘要。分工明确：摘要管全局进度，原文管细节。
+
+还有两个副作用：
+
+- **摘要本身要花钱**。每次压缩都是一次额外的模型调用。
+- **摘要是模型生成的，可能出错**。摘要里把文件路径写错了，模型后面就会拿着错误路径去找文件。压缩器的提示词要求保留「涉及的文件路径」，就是为了减少这类错误。
+
+## 小结
+
+- 上下文窗口是硬约束，长任务必然撞墙；压缩是唯一的续命手段。
+- token 用「字符数 / 3.6」估算：精确的 `count_tokens` 是异步的、要多一次网络请求，不适合放进每轮循环。
+- 预算 = `maxTokens × compactThreshold`，默认 200 000 × 0.7 = 140 000 token。
+- 压缩策略是「老的总结成摘要，最近 10 条原文不动」，近期细节不丢失。
+- 压缩不只是文本处理：切分点必须避开 `tool_use` / `tool_result` 的配对，否则历史非法，下一次请求会被 API 直接拒掉。
+- 压缩在每轮请求模型之前触发，也可以用 `/compact` 手动触发；系统提示词计入预算但永不参与压缩。
+- 摘要有损：过程细节会丢，这是保留最近若干条原文的理由。

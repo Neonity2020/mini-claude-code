@@ -1,0 +1,342 @@
+---
+title: 钩子
+description: 在工具执行前后插入自己的逻辑，做自动格式化、审计记录和危险操作拦截。
+---
+
+本章你要新写一个模块：`src/hooks/index.ts`——在 agent 执行工具的关键节点上插入你自己的逻辑，
+并且能让这些逻辑**拒绝**一个操作。
+
+## 钩子插在哪些位置
+
+钩子（hook）就是挂在 agent 生命周期上的几个回调点。我们关心三个：
+
+- **工具执行前（before）**：工具还没动手。这时候你可以检查参数、改写参数、或者直接拒绝。
+- **工具执行后（after）**：工具已经执行完，结果已经产生。这时候适合记录、统计、通知。
+- **一轮结束时（turn end）**：模型这一轮不再要求调工具、准备给用户交付结果的时候。
+
+## 典型用途
+
+这些活有一个共同点：**它们是确定性的，不需要模型判断。**
+
+- **写操作前跑 lint**：改了 TypeScript 文件，先跑一遍 `tsc --noEmit`，有错就拦住，
+  别让错误的代码留在用户仓库里。
+- **改文件前自动格式化**：项目里有 Prettier 约定时，agent 写完的文件直接格式化，
+  不用用户手动跑一次。
+- **记录审计日志**：谁在什么时候改了哪个文件、跑了什么命令，写进日志文件或送到审计系统。
+- **拦截危险命令**：权限模型管的是「这类命令危不危险」，钩子管的是「在**这个项目**里，
+  这条命令危不危险」——比如禁止在 CI 配置目录里跑 `git push`。
+
+## 关键特性：钩子不占模型上下文
+
+这一点是钩子和工具的**根本区别**，值得单独说。
+
+工具是给模型用的：模型的每次调用都要把工具描述和入参发出去，结果也要回填进上下文。
+钩子不是。钩子是你写的普通 TypeScript 函数，在 agent 进程内直接执行：
+
+- 不发 API 请求，不花 token
+- 不往 `messages` 里追加任何东西，主上下文完全不受影响
+- 结果也不回传给模型——除非你**主动**把它写进工具返回值里
+
+所以职责划分很清楚：**需要语义判断的活交给模型，需要确定性的活交给钩子。**
+让模型去做「给文件加个分号」，那是在用几十倍的算力做正则的事。
+
+## 钩子可以拒绝一个操作
+
+钩子不只能观察，还能否决。返回一个 `deny`，工具就不会被执行，agent 会收到一条
+`isError` 的 tool_result，模型看到后会改用别的办法——或者停下来问你。
+
+这让钩子成为「权限模型之后、副作用之前」的最后一道闸门。
+
+## 接入点：`#runTool` 里的那个缝隙
+
+看 `src/agent.ts` 里 `#runTool` 的真实结构，它分三步：
+
+```ts title="examples/mini-claude-code/src/agent.ts"
+    // 1. 权限检查
+    const check = this.#options.permissions?.check(tool, input);
+    if (check?.decision === 'deny') {
+      const result: ToolResult = {
+        content: `操作被拒绝：${check.matched?.reason ?? '权限规则拒绝'}。请换一种做法。`,
+        isError: true,
+      };
+      this.#options.onToolEnd?.(name, result);
+      return this.#toToolResult(toolUse.id, result);
+    }
+
+    if (check?.decision === 'ask') {
+      const allowed = await this.#confirmTool(tool.name, input, check.matched?.reason);
+      if (!allowed) {
+        const result: ToolResult = {
+          content: `用户拒绝了 ${name} 操作。请不要重试同一个操作，先说明你想做什么。`,
+          isError: true,
+        };
+        this.#options.onToolEnd?.(name, result);
+        return this.#toToolResult(toolUse.id, result);
+      }
+    }
+
+    if (this.#controller.signal.aborted) throw new Error('请求已取消');
+
+    // 2. 入参校验
+    const parsed = tool.schema.safeParse(input);
+    if (!parsed.success) {
+      const result: ToolResult = {
+        content: `参数不合法：${parsed.error.issues
+          .map((issue) => `${issue.path.join('.') || '(根)'} — ${issue.message}`)
+          .join('; ')}`,
+        isError: true,
+      };
+      this.#options.onToolEnd?.(name, result);
+      return this.#toToolResult(toolUse.id, result);
+    }
+
+    // 3. 执行
+    try {
+```
+
+权限检查（步骤 1）和执行（步骤 3）之间只隔着入参校验（步骤 2）。
+**在这两步之间插一个钩子调用，就是「权限放行之后、任何副作用发生之前」的最后一个安全点**：
+参数已经校验过（钩子拿到的是合法参数），权限已经放行（钩子不用重复做权限的事），
+而文件还没被写、命令还没被执行。
+
+真正插钩子的位置再往下一行——`ctx` 在 `try` 块里组装好之后，`tool.execute` 调用之前：
+
+```ts title="examples/mini-claude-code/src/agent.ts（本章新增改动）"
+    // 3. 执行
+    try {
+      const ctx: ToolContext = {
+        cwd: this.#options.cwd,
+        signal: this.#controller.signal,
+        confirm: async (request) => {
+          const allowed = await this.#options.onConfirm?.(request);
+          return allowed ?? false;
+        },
+        write: (message) => {
+          this.#options.onToolStart?.('__log__', message);
+        },
+        todos: this.#todos,
+        fileReads: this.#fileReads,
+      };
+
+      // ← 钩子插在这里（本章新增）
+      //    位置含义：ctx 已就绪，权限已放行，参数已校验，副作用尚未发生。
+
+      const result = await tool.execute(parsed.data, ctx);
+      this.#options.onToolEnd?.(name, result);
+      return this.#toToolResult(toolUse.id, result);
+    } catch (error) {
+```
+
+> 上面这段是**本章要加的改动**，`src/agent.ts` 目前还没有它。
+
+## 实现
+
+> 本章新增模块：`src/hooks/index.ts`。教程仓库里目前还没有这个文件。
+
+```ts title="src/hooks/index.ts"
+import type { Tool, ToolContext } from '../tools/types.js';
+
+/** 传给钩子的事件 */
+export interface HookEvent {
+  /** 即将执行（或刚执行完）的工具 */
+  tool: Tool;
+  /** 工具入参，已经过 schema 校验 */
+  input: Record<string, unknown>;
+  /** 和工具共享的执行上下文 */
+  ctx: ToolContext;
+}
+
+/** 钩子的裁决 */
+export interface HookDecision {
+  decision: 'allow' | 'deny';
+  /** deny 时必须给出原因，它会原样进入模型上下文 */
+  reason?: string;
+}
+
+export type Hook = (
+  event: HookEvent,
+) => HookDecision | void | Promise<HookDecision | void>;
+
+export interface HookManagerOptions {
+  /**
+   * 钩子自己抛错时的策略：
+   * - ignore：记一笔日志，继续执行（默认）
+   * - abort：直接中断整个流程
+   */
+  onError?: 'ignore' | 'abort';
+  /** 错误日志出口，默认打到 stderr */
+  log?: (message: string) => void;
+}
+
+/**
+ * 钩子管理器。
+ *
+ * 职责：在工具执行前后跑一组用户注册的回调，
+ * 并把「拒绝」的裁决交还给调用方。
+ */
+export class HookManager {
+  readonly #pre: Hook[] = [];
+  readonly #post: Hook[] = [];
+  readonly #onError: 'ignore' | 'abort';
+  readonly #log: (message: string) => void;
+
+  constructor(options: HookManagerOptions = {}) {
+    this.#onError = options.onError ?? 'ignore';
+    this.#log = options.log ?? ((message) => console.error(message));
+  }
+
+  /** 注册「工具执行前」的钩子 */
+  before(fn: Hook): this {
+    this.#pre.push(fn);
+    return this;
+  }
+
+  /** 注册「工具执行后」的钩子 */
+  after(fn: Hook): this {
+    this.#post.push(fn);
+    return this;
+  }
+
+  /** 跑一遍前置钩子。任何一个返回 deny，就地中止 */
+  async beforeTool(event: HookEvent): Promise<HookDecision | undefined> {
+    return await this.#run(this.#pre, event);
+  }
+
+  /** 跑一遍后置钩子。返回结果一律忽略——事已经发生了 */
+  async afterTool(event: HookEvent): Promise<void> {
+    await this.#run(this.#post, event);
+  }
+
+  async #run(
+    hooks: Hook[],
+    event: HookEvent,
+  ): Promise<HookDecision | undefined> {
+    for (const hook of hooks) {
+      try {
+        const decision = await hook(event);
+        if (decision?.decision === 'deny') return decision;
+      } catch (error) {
+        const message = `钩子执行失败：${(error as Error).message}`;
+        if (this.#onError === 'abort') throw new Error(message);
+        this.#log(message);
+      }
+    }
+    return undefined;
+  }
+}
+```
+
+写一个具体的钩子。自动格式化，用现成的 `bashTool` 就够了：
+
+```ts title="src/hooks/format-on-write.ts"
+import { bashTool } from '../tools/bash-tool.js';
+import type { Hook } from './index.js';
+
+/**
+ * 写文件后自动格式化。
+ *
+ * 这个钩子用 `.after()` 注册，跑在 Write/Edit 之后——
+ * 格式化的是已经写进去的内容，注册成前置钩子没有意义。
+ */
+export const formatOnWrite: Hook = async (event) => {
+  if (event.tool.name !== 'Write' && event.tool.name !== 'Edit') return;
+
+  const filePath = event.input.file_path;
+  if (typeof filePath !== 'string') return;
+
+  const result = await bashTool.execute(
+    { command: `npx prettier --write ${JSON.stringify(filePath)}` },
+    event.ctx,
+  );
+
+  if (result.isError) {
+    return { decision: 'deny', reason: `格式化失败：${result.content}` };
+  }
+};
+```
+
+再写一个审计钩子，它只记录，不干预：
+
+```ts title="src/hooks/audit.ts"
+import { appendFile } from 'node:fs/promises';
+import type { Hook } from './index.js';
+
+/** 把每一次工具调用记进审计日志 */
+export const auditLog: Hook = async (event) => {
+  const line = JSON.stringify({
+    at: new Date().toISOString(),
+    tool: event.tool.name,
+    input: event.input,
+  });
+  await appendFile('.mini-claude-code/audit.log', `${line}\n`, 'utf8');
+};
+```
+
+接到 agent 上：
+
+```ts title="examples/mini-claude-code/src/agent.ts（本章新增改动）"
+// 本章新增：在 AgentOptions 里加一个 hooks 字段
+export interface AgentOptions {
+  client: Anthropic;
+  tools: ToolRegistry;
+  permissions?: PermissionManager;
+  contextManager?: ContextManager;
+  hooks?: HookManager;
+  systemPrompt: string;
+  // ...
+}
+```
+
+然后在 `#runTool` 里用起来：
+
+```ts title="examples/mini-claude-code/src/agent.ts（本章新增改动）"
+// 3. 执行
+try {
+  const ctx: ToolContext = { /* ... */ };
+
+  const hook = await this.#options.hooks?.beforeTool({
+    tool,
+    input: parsed.data as Record<string, unknown>,
+    ctx,
+  });
+  if (hook?.decision === 'deny') {
+    const result: ToolResult = {
+      content: `操作被钩子拒绝：${hook.reason ?? '未说明原因'}。请换一种做法。`,
+      isError: true,
+    };
+    this.#options.onToolEnd?.(name, result);
+    return this.#toToolResult(toolUse.id, result);
+  }
+
+  const result = await tool.execute(parsed.data, ctx);
+
+  await this.#options.hooks?.afterTool({
+    tool,
+    input: parsed.data as Record<string, unknown>,
+    ctx,
+  });
+
+  this.#options.onToolEnd?.(name, result);
+  return this.#toToolResult(toolUse.id, result);
+} catch (error) {
+```
+
+<Callout type="warn" title="钩子失败了怎么办">
+  钩子是你写的代码，它也会抛异常——格式化工具没装、审计目录不可写、正则写错了。
+  这时候你必须**提前**定好策略，不能到时候再想：
+  - **静默跳过（ignore）**：记一条日志，继续执行。适合审计、通知这类「锦上添花」的钩子。
+  - **中断流程（abort）**：直接抛出去。适合 lint、校验这类「不通过就不该继续」的钩子。
+  两种都有道理，但混用是最糟的：审计钩子一失败就中断，agent 直接瘫在原地；
+  校验钩子一失败就跳过，错误代码照样写进用户仓库。
+  所以 `HookManagerOptions.onError` 应该按钩子的**用途**分开配置，
+  而不是全局一个开关。默认 `ignore` 是更安全的选择——钩子不该成为 agent 的单点故障。
+</Callout>
+
+## 小结
+
+- 钩子插在工具执行前、执行后、轮次结束三个位置，本章实现了前两个。
+- 钩子最大的优势：在你的进程里跑，不花 token、不进模型上下文。
+- 最佳接入点是 `#runTool` 里 `ctx` 组装好之后、`tool.execute` 之前——
+  权限已放行、参数已校验、副作用尚未发生。
+- 钩子可以返回 `deny` 否决操作，但**必须提前决定钩子失败时是跳过还是中断**。
+- 下一章 [打包发布](/docs/advanced/production) 讲的是另外一件事：怎么让别人也能跑起来。

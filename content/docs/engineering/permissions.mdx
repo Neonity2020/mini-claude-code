@@ -1,0 +1,301 @@
+---
+title: 权限模型
+description: 把放行、询问、拒绝三种判定写成一组有序规则：危险操作直接拒绝，命令一律要你确认。
+---
+
+本章你会得到一个能回答「这次工具调用放不放行」的权限管理器，以及一套可以直接改写的默认规则。
+
+## 概念：三种决策
+
+权限模型只回答一个问题：**这次工具调用该怎么办**。答案只有三种，定义在 `src/tools/types.ts` 里：
+
+```ts title="src/tools/types.ts"
+/** 权限决策 */
+export type PermissionDecision = 'allow' | 'ask' | 'deny';
+```
+
+- `allow`——直接执行，不打扰用户。适合只读操作。
+- `ask`——把命令或路径摆到用户面前，等一个「y」。适合会改变状态但可逆的操作。
+- `deny`——不执行，把拒绝原因回传给模型。适合不可逆或越权的操作。
+
+注意 `deny` 和「用户点了否」是两回事。`deny` 是规则层面的拒绝：没有用户能批准它。用户拒绝是一次运行时决定，模型得到的反馈也不同——一个是「你换个做法」，一个是「别重试同一个操作」。
+
+## 规则的形状
+
+一条规则就是一组「匹配条件 + 决策」：
+
+```ts title="src/permissions.ts"
+/** 一条权限规则 */
+export interface PermissionRule {
+  /** 工具名，`*` 表示全部 */
+  tool: string;
+  /**
+   * 主参数的正则。留空表示匹配该工具的任意调用。
+   * 例如 Bash + "rm -rf" 表示只有 rm -rf 类命令命中这条规则。
+   */
+  pattern?: string;
+  decision: PermissionDecision;
+  /** 命中时给用户看的原因 */
+  reason?: string;
+}
+```
+
+<TypeTable
+  type={{
+    tool: {
+      type: 'string',
+      required: true,
+      description: '工具名，必须与注册表里的工具名完全一致；星号表示匹配全部工具',
+    },
+    pattern: {
+      type: 'string',
+      description: '主参数上的正则表达式。留空表示匹配该工具的任意一次调用',
+    },
+    decision: {
+      type: "'allow' | 'ask' | 'deny'",
+      required: true,
+      description: '命中这条规则后的决策',
+    },
+    reason: {
+      type: 'string',
+      description: '命中原因。会显示给用户，也会在拒绝时回传给模型',
+    },
+  }}
+/>
+
+## 默认规则集
+
+`src/permissions.ts` 里的 `DEFAULT_RULES`，逐字如下：
+
+```ts title="src/permissions.ts"
+/**
+ * 默认规则集。
+ *
+ * 排序很重要：**从上到下第一条命中的规则生效**。
+ * 这样「危险命令」必须排在「Bash 一律放行」之前。
+ */
+export const DEFAULT_RULES: PermissionRule[] = [
+  // 1. 绝对禁止：不可逆且影响系统级
+  {
+    tool: 'Bash',
+    pattern: 'rm\\s+(-[a-zA-Z]*[rf][a-zA-Z]*\\s+)*(/|~|\\*)',
+    decision: 'deny',
+    reason: '该命令会递归删除根目录或家目录，属于不可逆的破坏性操作',
+  },
+  {
+    tool: 'Bash',
+    pattern: '\\b(mkfs|dd\\s+if=|shutdown|reboot|halt)\\b',
+    decision: 'deny',
+    reason: '该命令会破坏磁盘或系统状态',
+  },
+  {
+    tool: 'Bash',
+    pattern: '\\bsudo\\b|\\bsu\\b',
+    decision: 'deny',
+    reason: '不允许提权执行',
+  },
+  {
+    tool: 'Bash',
+    pattern: ':\\(\\)\\s*\\{|\\bchmod\\s+777\\b',
+    decision: 'deny',
+    reason: '疑似 fork 炸弹或过度放宽权限',
+  },
+
+  // 3. 其余 Bash：需要确认
+  {
+    tool: 'Bash',
+    decision: 'ask',
+    reason: '该命令会改变系统状态',
+  },
+
+  // 4. 写文件：需要确认
+  { tool: 'Write', decision: 'ask', reason: '将写入或覆盖文件' },
+  { tool: 'Edit', decision: 'ask', reason: '将修改文件内容' },
+
+  // 5. 只读工具：直接放行
+  { tool: 'Read', decision: 'allow', reason: '只读操作' },
+  { tool: 'Glob', decision: 'allow', reason: '只读操作' },
+  { tool: 'Grep', decision: 'allow', reason: '只读操作' },
+  { tool: 'TodoWrite', decision: 'allow', reason: '只操作会话状态' },
+];
+```
+
+读这份规则表时，注意几个设计选择：
+
+- 四条 `deny` 规则全部限定在 `Bash` 上，且都带 `pattern`。文件操作不需要这一层——`Write` 和 `Edit` 是 `ask` 而不是 `deny`，因为删一个文件和覆盖一个文件的危险程度差不多。
+- **其余 Bash 一律 `ask`**。规则表里没有只读命令白名单：`ls`、`cat`、`head`、`tail` 同样要你点一次确认。源码里的规则编号是 1、3、4、5，2 号空着——那不是笔误，是被删掉的白名单留下的空位。
+- `TodoWrite` 归到 `allow`：它只改会话内的待办状态，不碰文件系统。
+
+<Callout type="warn" title="取舍：所有 Bash 命令都要确认">
+  早期版本给 `ls`、`cat`、`head`、`tail` 这类只读命令留了一条白名单规则，直接 `allow` 放行。现在这条规则删掉了，**每一条 Bash 命令都要你点头**。
+
+  删它是有道理的：白名单匹配的是命令字符串，而字符串可以被改写。`ls > changed` 是重定向，`echo $(touch changed)` 是命令替换，`echo ok; touch changed` 是复合命令——它们都以白名单里的词开头，规则却会全部放行。一条能被改写绕过的白名单，给不了你任何安全感。
+
+  代价很实在：agent 每跑一条命令你都要点一次，一个稍复杂的任务点十几次。仓库里的测试 `Bash 复合命令和只读命令都需要确认` 盯的就是这条——连 `ls` 都必须得到 `ask`。
+
+  真正的解法不是加回白名单，而是把命令放进隔离环境（容器、虚拟机）：确认提示只用来拦「意外」，不用来拦「恶意」。
+</Callout>
+
+```ts title="test/tools.test.ts"
+test('Bash 复合命令和只读命令都需要确认', async () => {
+  const { PermissionManager } = await import('../src/permissions.js');
+  const permissions = new PermissionManager();
+  const bash = registry.get('Bash')!;
+  for (const command of ['echo ok; touch changed', 'ls > changed', 'echo $(touch changed)', 'ls']) {
+    assert.equal(permissions.check(bash, { command }).decision, 'ask', command);
+  }
+});
+```
+
+## 排序语义：第一条命中的规则生效
+
+这是整套规则里最容易写错的一点。`check()` 是一个 for 循环，遇到第一条匹配的规则就 `return`：
+
+```ts title="src/permissions.ts"
+    for (const rule of this.#rules) {
+      if (rule.tool !== '*' && rule.tool !== tool.name) continue;
+
+      if (rule.pattern) {
+        if (!primaryValue) continue;
+        if (!new RegExp(rule.pattern, 'i').test(primaryValue)) continue;
+      }
+
+      return { decision: rule.decision, matched: rule };
+    }
+```
+
+也就是说**后面的规则永远不会被看到**。所以危险规则必须排在宽泛规则之前——如果把「Bash 一律 allow」放在第一条，后面所有 `deny` 都是死代码。
+
+这个设计有一个直接的好处：规则表读起来就是一份**按优先级排列的策略文档**，从上到下越来越宽松。你想放宽某个行为，就在对应位置加一条更精确的规则，而不是去改后面的兜底规则。
+
+<Callout type="warn" title="黑名单思维还是白名单思维">
+  `DEFAULT_RULES` 的结构是**黑名单 + 默认询问**：先把少数几个危险的命令（`rm -rf /`、`mkfs`、`sudo`、fork 炸弹）直接 `deny`，剩下的 Bash 一律走 `ask`。它的问题是：黑名单永远列不全。`rm -rf $HOME`、`curl | sh`、`git push --force`、`chmod -R 777`、手写 `rm -rf /some/path`（没带 `/` 前缀就不匹配第一条规则）……每一条都要有人想到才能被挡住。
+
+  **另一条路是白名单思维**：只允许一组明确安全的操作，其余一律 `ask` 或 `deny`。规则写起来更长，但漏网之鱼从「不可预期的危险」变成了「需要多写一行才能放行」。
+
+  Mini Claude Code 选了更保守的那条：默认全 `ask`，白名单一条不留。于是「漏网」不再是安全问题，只是多点一次确认。真正放到别人机器上跑的 agent 也该这样——权限层默认 `ask`，白名单只用来免除确认，把「点一次」的负担留给安全，把「放行」的开销留给用户自己承担。
+</Callout>
+
+## primaryParam：规则怎么匹配到具体内容
+
+规则光有工具名是不够的。「Bash 要确认」和「`rm -rf /` 要拒绝」的区别在于命令内容。`Tool` 接口里的 `primaryParam` 指定了「拿哪个参数去匹配」：
+
+```ts title="src/tools/types.ts"
+  /**
+   * 工具的主参数名，用于权限规则匹配
+   * 例如 Bash 的 command、Write 的 file_path
+   */
+  primaryParam?: string;
+```
+
+对应关系是：`Bash` → `command`，`Write` / `Edit` / `Read` → `file_path`，`Glob` / `Grep` → `pattern`，`TodoWrite` → `todos`。
+
+`check()` 的第一件事就是把这个参数取出来：
+
+```ts title="src/permissions.ts"
+  check(tool: Tool, input: Record<string, unknown>): PermissionCheck {
+    const primaryValue =
+      tool.primaryParam && typeof input[tool.primaryParam] === 'string'
+        ? (input[tool.primaryParam] as string)
+        : undefined;
+```
+
+两个细节值得注意。第一，正则是大小写不敏感的（`new RegExp(rule.pattern, 'i')`），所以 `RM -RF /` 一样会被挡住。第二，如果 `primaryValue` 是 `undefined`——比如某个工具的 `primaryParam` 指向的字段没传，或者传的不是一个字符串——那么**所有带 `pattern` 的规则都会被跳过**（`if (!primaryValue) continue;`）。这不是 bug，但意味着「给 Bash 写一条只有 pattern 没有兜底的 deny 规则」是不可靠的：一旦命令参数不是字符串，那条 deny 就失效了。工具定义里 `primaryParam` 选错字段，规则会静默失效。
+
+## 没有规则命中时怎么办
+
+规则表不可能覆盖所有工具。`check()` 的最后一行是兜底：
+
+```ts title="src/permissions.ts"
+    // 没有规则命中时，退回工具自己声明的默认策略
+    return { decision: tool.permission };
+```
+
+也就是说，每个工具都自带一个默认策略（`Tool.permission` 字段），规则表是在它之上的**覆盖层**。Bash 声明的是 `ask`，所以哪怕把 `DEFAULT_RULES` 全部删掉，Bash 依然要问用户；而 `Read` 声明的是 `allow`，没有规则覆盖时直接放行。
+
+这个兜底的意义是：新增一个工具时，你不用记得改权限表，只要在工具定义里写清楚默认策略，它就有合理的行为。
+
+## 检查发生在工具执行之前
+
+权限判定在 `Agent` 的 `#runTool()` 里，是执行前的第一道关卡，排在参数校验和真正执行之前：
+
+```ts title="src/agent.ts"
+    // 1. 权限检查
+    const check = this.#options.permissions?.check(tool, input);
+    if (check?.decision === 'deny') {
+      const result: ToolResult = {
+        content: `操作被拒绝：${check.matched?.reason ?? '权限规则拒绝'}。请换一种做法。`,
+        isError: true,
+      };
+      this.#options.onToolEnd?.(name, result);
+      return this.#toToolResult(toolUse.id, result);
+    }
+
+    if (check?.decision === 'ask') {
+      const allowed = await this.#confirmTool(tool.name, input, check.matched?.reason);
+      if (!allowed) {
+        const result: ToolResult = {
+          content: `用户拒绝了 ${name} 操作。请不要重试同一个操作，先说明你想做什么。`,
+          isError: true,
+        };
+        this.#options.onToolEnd?.(name, result);
+        return this.#toToolResult(toolUse.id, result);
+      }
+    }
+    // ...
+    // 2. 入参校验
+    const parsed = tool.schema.safeParse(input);
+    // ...
+    // 3. 执行
+```
+
+被拒绝时不是简单地「返回失败」就完事，而是把**拒绝原因**写进 `tool_result` 回传给模型，并且给出明确的下一步指令：「请换一种做法」。这一点是权限模型能发挥作用的关键——如果只告诉模型「失败了」，它多半会原样重试一次。
+
+用户拒绝时的措辞不同：「不要重试同一个操作，先说明你想做什么」。区别在于——规则拒绝说明「这条路本身走不通」，用户拒绝说明「你换个说法，我再考虑」。
+
+同一轮里的多个工具是**串行**执行的：
+
+```ts title="src/agent.ts"
+      // 串行执行，避免写入竞争和确认提示交错。
+      const results: ToolResultBlockParam[] = [];
+      for (const toolUse of toolUses) results.push(await this.#runTool(toolUse));
+```
+
+这对权限模型很关键：模型一轮里请求三个工具，你看到的也是三个**依次出现**的确认提示，而不是三个挤在一起的弹窗。
+
+命令本身的执行细节（超时、输出截断、工作目录）见 [命令执行](/docs/tools/bash-tools)。
+
+## 扩展规则
+
+`PermissionManager` 支持在运行时加规则，而且新规则会插到**最前面**：
+
+```ts title="src/permissions.ts"
+  addRule(rule: PermissionRule): this {
+    // 新规则插到最前面，保证用户自定义规则优先生效
+    this.#rules.unshift(rule);
+    return this;
+  }
+```
+
+于是「我这个项目里，`pnpm test` 永远可以自动跑」就是一行：
+
+```ts title="src/index.ts（示例调用）"
+permissions.addRule({
+  tool: 'Bash',
+  pattern: '^pnpm\\s+(test|build)\\b',
+  decision: 'allow',
+  reason: '项目内固定的测试与构建命令',
+});
+```
+
+`unshift` 的代价是：加的规则多了以后，最前面那一段会变得难读。建议把用户自定义规则单独收集起来，放到另一个文件加载，运行时统一 `addRule`。
+
+## 小结
+
+- 权限只有三种决策：`allow`、`ask`、`deny`，由 `PermissionDecision` 定义。
+- 规则是有序列表，**从上到下第一条命中的生效**，所以危险规则必须排在宽泛规则之前。
+- `primaryParam` 决定拿工具的哪个参数去匹配正则；取不到值时，带 `pattern` 的规则会被跳过。
+- 没有任何规则命中时，退回工具自己声明的 `permission` 字段，所以新增工具不会「裸奔」。
+- 权限检查发生在执行之前；被拒绝时把原因和「换个做法」的指令回传给模型，否则它会原地重试。
+- 默认策略是「所有 Bash 都问」：只读命令白名单已被删掉，安全优先，代价是每条命令都要点一次确认。
+- 同一轮的工具串行执行，确认提示一个一个来，不会互相打断。

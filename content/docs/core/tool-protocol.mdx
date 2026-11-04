@@ -1,0 +1,279 @@
+---
+title: 工具调用协议
+description: tool_use 与 tool_result 的消息格式规范，以及为什么工具结果必须以 user 消息回传。
+---
+
+本章你会彻底搞清消息是怎么在模型和你之间来回传递的，以及那些「明明代码没错却报协议错误」的原因。
+
+## 三种角色，两种内容块
+
+整个协议只涉及三个角色和两种关键内容块。
+
+**角色**：
+
+- `user` — 用户的输入，或者（关键点）工具的执行结果
+- `assistant` — 模型的输出
+- `system` — 系统提示词，但它是**独立的顶层参数**，不放在 messages 数组里
+
+**关键内容块**：
+
+- `text` — 纯文本
+- `tool_use` — 模型请求调用某个工具
+- `tool_result` — 你回传给模型的工具执行结果
+
+## 一次完整往返
+
+假设用户说「看看 src/app.ts 有什么」，一个完整的往返是**四条消息**：
+
+```json title="messages 数组的真实样子"
+[
+  {
+    "role": "user",
+    "content": "看看 src/app.ts 有什么"
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "我先读一下这个文件。"
+      },
+      {
+        "type": "tool_use",
+        "id": "toolu_01ABC",
+        "name": "Read",
+        "input": { "file_path": "src/app.ts" }
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "toolu_01ABC",
+        "content": "     1\texport function main() {..."
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "text",
+        "text": "src/app.ts 里定义了 main 函数……"
+      }
+    ]
+  }
+]
+```
+
+注意第 3 条消息的角色是 **`user`**，尽管它的内容来自工具。
+
+<Callout type="warn" title="这是最容易踩的协议错误">
+  把 `tool_result` 放进 `assistant` 消息，或者用 `role: "tool"`（那是
+  OpenAI 的格式），Anthropic API 会直接返回 400 错误。
+  「工具结果由用户提供给模型」——这个语义是刻意的：模型看到的是
+  「外部世界告诉我的信息」，而不是「我自己说过的话」。
+</Callout>
+
+## tool_use 与 tool_result 的字段
+
+<TypeTable
+  type={{
+    'tool_use': {
+      type: 'assistant 内容块',
+      description: '模型请求调用工具',
+      properties: {
+        id: {
+          type: 'string',
+          description: '本次调用的唯一标识。回传结果时必须原样带上',
+        },
+        name: {
+          type: 'string',
+          description: '工具名，必须是注册表里注册过的名字',
+        },
+        input: {
+          type: 'object',
+          description: '入参。是一个已经解析好的对象，不是 JSON 字符串',
+        },
+      },
+    },
+    'tool_result': {
+      type: 'user 内容块',
+      description: '工具执行结果回传给模型',
+      properties: {
+        tool_use_id: {
+          type: 'string',
+          description: '对应哪个 tool_use。必须能一一对上',
+        },
+        content: {
+          type: 'string',
+          description: '结果的文本内容。模型只能看到这段文字',
+        },
+        is_error: {
+          type: 'boolean',
+          description: '标记这次调用失败。默认 false',
+        },
+      },
+    },
+  }}
+/>
+
+## 一一对应是最硬的约束
+
+每一个 `tool_use` 都必须有且仅有一个对应的 `tool_result`。
+
+**并行调用的处理**：模型一轮里可以请求多个工具，这时多个 `tool_result` 要放在**同一条** user 消息里，按 `tool_use_id` 各自对应：
+
+```json
+{
+  "role": "user",
+  "content": [
+    { "type": "tool_result", "tool_use_id": "toolu_01A", "content": "..." },
+    { "type": "tool_result", "tool_use_id": "toolu_02B", "content": "..." }
+  ]
+}
+```
+
+不能拆成两条 user 消息，也不能少回一个。漏回一个，API 会拒绝整个请求。
+
+<Callout type="idea" title="为什么不能漏">
+  因为下一轮请求会把整个 `messages` 数组重新发过去。模型会看到
+  「我请求了三个工具，但只收到两个结果」——它不知道第三个是被丢了
+  还是还在跑。这种不确定性会让模型做出错误推断。API 直接报错，
+  反而是一种保护。
+</Callout>
+
+## 我们的实现
+
+把 `tool_use` 转成 `tool_result` 的地方在 `src/agent.ts`：
+
+```ts title="src/agent.ts"
+#toToolResult(
+  toolUseId: string,
+  result: ToolResult,
+): ToolResultBlockParam {
+  return {
+    type: 'tool_result',
+    tool_use_id: toolUseId,
+    content: result.content,
+    is_error: result.isError,
+  };
+}
+```
+
+注意 `content` 是**字符串**。这是工具设计里最容易被忽视的一点：
+
+> 模型看不到你的终端，它只能看到你回传的这段文字。
+
+所以工具的返回值必须同时满足两个读者：
+
+- **模型**：需要足够的信息来完成下一步推理。文件内容、错误原因、匹配的行
+- **人**：需要能看懂发生了什么。`已修改 src/app.ts` 比 `ok` 好一百倍
+
+```ts title="src/tools/fs-tools.ts（示例对比）"
+// 好：模型知道改了什么
+return { content: `已修改 ${input.file_path}。` };
+
+// 不好：模型只能猜
+return { content: 'ok' };
+```
+
+<Callout type="idea" title="工具返回值是 agent 的「感官」">
+  一个 agent 的能力上限，取决于它的工具能返回多丰富的观察结果。
+  Read 工具返回带行号的全文，Grep 返回带行号的匹配行——这些细节
+  直接决定了模型能不能准确定位问题。反过来，一个只会返回
+  `{"ok": true}` 的工具集，做不出任何复杂的事。
+</Callout>
+
+## 错误也要走同一条路
+
+工具失败时，**结构完全一样**，只是加上 `is_error: true`：
+
+```ts title="src/agent.ts"
+const check = this.#options.permissions?.check(tool, input);
+if (check?.decision === 'deny') {
+  const result: ToolResult = {
+    content: `操作被拒绝：${check.matched?.reason ?? '权限规则拒绝'}。请换一种做法。`,
+    isError: true,
+  };
+  this.#options.onToolEnd?.(name, result);
+  return this.#toToolResult(toolUse.id, result);
+}
+```
+
+三个要点：
+
+1. **不要抛异常**。抛异常会让整个 agent 崩掉，而不是让模型换个策略。
+2. **错误信息要对模型有用**。「操作被拒绝：不允许提权执行。请换一种做法。」比「权限错误」有用得多——它告诉模型「这条路走不通，但可以走别的」。
+3. **`is_error: true` 是给模型的信号**，让它知道这次没成功，需要调整。
+
+参数校验失败也是同样处理：
+
+```ts title="src/agent.ts"
+const parsed = tool.schema.safeParse(input);
+if (!parsed.success) {
+  const result: ToolResult = {
+    content: `参数不合法：${parsed.error.issues
+      .map((issue) => `${issue.path.join('.') || '(根)'} — ${issue.message}`)
+      .join('; ')}`,
+    isError: true,
+  };
+  this.#options.onToolEnd?.(name, result);
+  return this.#toToolResult(toolUse.id, result);
+}
+```
+
+这里把每个出错的字段路径和原因都列出来了。模型看到「第 3 行——expected string, received number」，就能立刻改对。
+
+<Callout type="idea" title="校验错误是最容易白捡的改进点">
+  模型第一次调工具经常参数不对（字段名拼错、类型不对）。
+  如果你只是返回「参数错误」，模型会反复试同样的错误。
+  把 zod 的 issue 完整回传，模型一次就能改对。这是投入产出比最高的
+  一个细节。
+</Callout>
+
+## 系统提示词不在 messages 里
+
+最后一个小细节。系统提示词是 `messages.create()` 的**顶层参数**，不是 messages 数组里的一条消息：
+
+```ts title="src/agent.ts"
+const stream = this.#options.client.messages.stream(
+  {
+    model: this.#options.model,
+    max_tokens: 8_192,
+    system: this.#options.systemPrompt,
+    messages: this.#messages,
+    tools: this.#options.tools.toAnthropicTools(),
+  },
+  { signal: this.#controller.signal },
+);
+```
+
+注意 `system` 是顶层参数，和 `messages` 平级；`messages` 数组里不含 system 消息。写成 `messages: [{ role: 'system', content: ... }]` 会报错。
+
+写成 `messages: [{ role: 'system', content: ... }]` 会报错。
+
+## 排查清单
+
+遇到「协议错误」时，按这个顺序查：
+
+| 症状 | 大概率原因 |
+| --- | --- |
+| 400，提示 role 不合法 | `tool_result` 放在了 `assistant` 消息里 |
+| 400，提示缺少 tool_result | 有 `tool_use` 没有对应的 `tool_result` |
+| 400，提示 tool_use_id 不匹配 | id 写错，或并行调用时拆成了多条消息 |
+| 400，提到 system | 系统提示词被塞进了 messages 数组 |
+| 模型行为莫名奇怪 | 某个工具的返回值太空洞，模型拿不到有效信息 |
+
+## 小结
+
+- 三种角色：`user` / `assistant` / `system`，其中 `system` 是顶层参数
+- `tool_use` 在 assistant 消息里，`tool_result` 在 **user** 消息里
+- 每个 `tool_use` 恰好对应一个 `tool_result`，并行调用时放在同一条 user 消息
+- 工具返回值是模型唯一的「感官」，写给模型看，也要写给人看
+- 错误走同一条通路：`is_error: true` + 有用的错误信息，不要抛异常
+- 把校验错误完整回传，是提升工具调用准确率最快的手段
+
+下一章我们进入工具系统：怎么用一份 schema 同时喂给模型和运行时校验。

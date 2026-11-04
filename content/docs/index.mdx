@@ -1,0 +1,137 @@
+---
+title: Mini Claude Code 教程
+description: 从零手写一个终端里的编程助手，22 章覆盖 agent 循环、工具系统、上下文工程与权限模型。
+---
+
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+<Callout type="info" title="这个教程要什么">
+  你需要会写 TypeScript，知道 HTTP 请求和 JSON 是什么。不需要了解 AI，
+  更不需要用过 Claude Code。
+</Callout>
+
+## 这个教程在做什么
+
+我们从零写一个叫 **Mini Claude Code** 的命令行编程助手。
+
+它做的事和 Claude Code 一样：你在终端里用自然语言描述任务，它自己读代码、
+改代码、跑命令、告诉你改了什么。
+
+但我们**不用任何 Agent 框架**——不用 Claude Agent SDK，不用 LangChain，
+不用 OpenAI SDK 的 agent helper。我们只用最朴素的两样东西：
+
+- Anthropic Messages API
+- TypeScript 标准库
+
+所有的编排逻辑——agent 循环、工具调度、参数校验、权限判定、上下文压缩、
+子代理——都自己写。
+
+<Callout type="idea" title="为什么要绕开现成的 SDK">
+  框架会把关键决策藏起来：循环怎么转、上下文满了怎么办、工具冲突了听谁的。
+  这些决策恰恰是一个 coding agent 最难的部分。亲手写一遍，你以后用
+  Claude Code 时就知道它为什么这么设计了。
+</Callout>
+
+## 最终成果
+
+全部代码在 `examples/mini-claude-code/`，克隆下来就能跑：
+
+```bash
+cd examples/mini-claude-code
+pnpm install
+export LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=sk-ant-xxx
+pnpm start
+```
+
+跑起来是一个 REPL：
+
+```
+› 看看 src/agent.ts 里 agent 循环是怎么写的
+
+● 我先找到这个文件。
+⏺ Read src/agent.ts
+  ✓ Read
+
+● 核心循环在 `run()` 方法里，整体是一个 while 循环：
+  1. 调用模型
+  2. 如果 stop_reason 不是 tool_use，任务结束
+  3. 否则执行工具，把结果作为 user 消息喂回去，继续循环
+```
+
+它有这些能力：
+
+- 读文件、写文件、精确编辑文件
+- 按模式搜索文件名、按正则搜索文件内容
+- 执行 shell 命令（带危险命令拦截）
+- 维护待办清单，让多步任务可见
+- 上下文满了自动压缩历史
+- 危险操作需要你点头才执行
+
+## 章节地图
+
+### 起步
+
+<Cards>
+  <Card title="环境准备" href="/docs/getting-started/setup" description="装依赖、跑通第一个 agent、拿到 API key" />
+  <Card title="架构总览" href="/docs/getting-started/architecture" description="Claude Code 内部长什么样，我们的版本对应哪些部分" />
+  <Card title="第一个 Agent" href="/docs/getting-started/first-agent" description="30 行代码跑通一次完整的模型调用" />
+</Cards>
+
+### 核心循环
+
+<Cards>
+  <Card title="Agent 循环" href="/docs/core/agent-loop" description="整个教程的心脏：模型、工具、结果的往返" />
+  <Card title="流式响应" href="/docs/core/streaming" description="让输出逐字出现，并正确拼装工具入参" />
+  <Card title="工具调用协议" href="/docs/core/tool-protocol" description="tool_use 与 tool_result 的消息格式规范" />
+  <Card title="多模型接入" href="/docs/core/providers" description="一套 Anthropic 协议背后接住 Anthropic、OpenAI 与兼容服务" />
+</Cards>
+
+### 工具系统
+
+<Cards>
+  <Card title="Schema 与注册表" href="/docs/tools/schema" description="一份 zod schema 同时喂给模型和运行时校验" />
+  <Card title="文件工具" href="/docs/tools/file-tools" description="Read / Write / Edit，以及沙箱与读后写校验" />
+  <Card title="搜索工具" href="/docs/tools/search-tools" description="Glob 与 Grep 的实现取舍" />
+  <Card title="命令执行" href="/docs/tools/bash-tools" description="Bash 工具、超时控制与输出截断" />
+  <Card title="任务清单" href="/docs/tools/todo-tools" description="TodoWrite 如何让多步任务变得可见" />
+</Cards>
+
+### 工程化
+
+<Cards>
+  <Card title="系统提示词" href="/docs/engineering/system-prompt" description="提示词怎么写才真的能改变模型行为" />
+  <Card title="权限模型" href="/docs/engineering/permissions" description="规则化的 allow / ask / deny 决策" />
+  <Card title="上下文管理" href="/docs/engineering/context" description="窗口预算与历史压缩策略" />
+  <Card title="项目记忆" href="/docs/engineering/memory" description="CLAUDE.md：让 agent 记住你的项目约定" />
+</Cards>
+
+### 进阶与实战
+
+<Cards>
+  <Card title="子代理" href="/docs/advanced/subagents" description="把子任务扔进独立上下文，只收回摘要" />
+  <Card title="MCP 接入" href="/docs/advanced/mcp" description="接入外部工具服务" />
+  <Card title="钩子" href="/docs/advanced/hooks" description="在关键节点插入自己的逻辑" />
+  <Card title="打包发布" href="/docs/advanced/production" description="从玩具变成能装进别人电脑的工具" />
+  <Card title="端到端实战" href="/docs/practice/capstone" description="完整走一遍，附设计复盘" />
+</Cards>
+
+## 怎么用这个教程
+
+**如果你想快速跑通**：直接看
+[环境准备](/docs/getting-started/setup) 和
+[第一个 Agent](/docs/getting-started/first-agent)，半小时能有一个能对话的 CLI。
+
+**如果你想理解原理**：从
+[架构总览](/docs/getting-started/architecture) 开始顺着读，
+每章末尾的「小结」会点出这一章新增的认知。
+
+**如果你想抄代码**：`examples/mini-claude-code/` 里的每一章产物都在，
+带注释和测试，直接改就行。
+
+<Callout type="warn" title="关于 API key">
+  本教程需要你自己的 Anthropic API key。所有请求都由你的 key 发起，
+  费用计入你的账户。动手前先看一眼
+  [Anthropic 定价](https://platform.claude.com/docs/en/about-claude/pricing)，
+  心里有个数再开始——agent 循环很容易在你不注意时多跑几轮。
+</Callout>

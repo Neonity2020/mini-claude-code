@@ -1,0 +1,273 @@
+---
+title: Schema 与注册表
+description: 一份 zod schema 生成模型入参格式和运行时校验，避免文档与实现不一致。
+---
+
+本章你会得到一个工具层：任何工具都只写一份 zod schema，就同时得到「给模型看的入参格式」和「运行时的参数校验」，并且可以统一注册、统一转换成 Anthropic 要的工具列表。
+
+## 工具描述是写给模型看的
+
+模型决定「调哪个工具」的时候，手上只有三样东西：工具名、工具描述、入参的 JSON Schema。它看不到你的 TypeScript 实现，也看不到工具内部干了什么。
+
+所以 `description` 不是给同事看的注释，它本身就是提示词（prompt）的一部分。
+
+```ts title="src/tools/fs-tools.ts"
+  description:
+    '读取一个文件的内容，返回带行号的文本。适用于查看源码、配置文件、日志。' +
+    '文件很大时用 offset/limit 分段读取。',
+```
+
+这段描述回答了三个问题：做什么（读取内容）、返回什么（带行号的文本）、什么时候用（源码、配置、日志）。模型据此就能在「想知道某个文件里写了什么」的时候选中它。
+
+<Callout type="warn" title="schema 写不清楚，模型就会乱传参数">
+  字段名要像命令一样有指向性——用 `file_path` 而不是 `path`，用 `old_string`
+  而不是 `target`；每个字段都加 `describe()` 说明「填什么」。描述含糊时模型
+  会两种出错：传错字段名，或者多传一堆没定义的字段。而一次读取 5MB 日志的
+  调用，就足以吃掉一半上下文窗口。
+</Callout>
+
+## 一份 schema，两处使用
+
+工具入参用 zod 声明。一份声明，两个用途：
+
+```ts title="src/tools/fs-tools.ts"
+const schema = z.object({
+  file_path: z.string().describe('要读取的文件的绝对路径或相对工作目录的路径'),
+  offset: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe('起始行号，从 1 开始。不填则从头读取'),
+  limit: z.number().int().min(1).optional().describe('最多读取多少行'),
+});
+```
+
+**用途一：派生给模型的 JSON Schema。** 转换发生在注册表里，用的是 zod v4 的 `z.toJSONSchema`：
+
+```ts title="src/tools/registry.ts"
+  /** 转换成 Anthropic API 期望的工具列表 */
+  toAnthropicTools(): AnthropicTool[] {
+    return this.list().map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: z.toJSONSchema(tool.schema, {
+        io: 'input',
+        // 额外字段一律拒绝，避免模型幻觉出没定义的参数
+        override: (ctx) => {
+          const schema = ctx.jsonSchema as Record<string, unknown>;
+          if (schema.type === 'object') {
+            schema.additionalProperties = false;
+          }
+        },
+      }) as unknown as AnthropicTool['input_schema'],
+    }));
+  }
+```
+
+三个细节值得注意：
+
+- `io: 'input'` 表示只转换输入侧，输出侧的 schema 不参与。
+- `override` 里给每个 object 补上 `additionalProperties: false`，等于在协议层告诉模型「没有定义的参数不许传」。
+- `describe()` 写下的说明会原样进入 JSON Schema 的 `description`，模型能直接读到。
+
+**用途二：运行时校验。** 模型返回的参数是不可信输入，执行前必须校验：
+
+```ts title="src/agent.ts"
+    // 2. 入参校验
+    const parsed = tool.schema.safeParse(input);
+    if (!parsed.success) {
+      const result: ToolResult = {
+        content: `参数不合法：${parsed.error.issues
+          .map((issue) => `${issue.path.join('.') || '(根)'} — ${issue.message}`)
+          .join('; ')}`,
+        isError: true,
+      };
+      this.#options.onToolEnd?.(name, result);
+      return this.#toToolResult(toolUse.id, result);
+    }
+```
+
+用 `safeParse` 而不是 `parse`，是因为校验失败不该让整个 agent 崩掉——失败信息要变成一条工具结果回传给模型，让模型自己改参数重试。校验通过后拿到的 `parsed.data` 才是类型安全的入参。
+
+同一份 schema 同时喂给模型和运行时校验，好处是「文档写的」和「实际校验的」永远一致：改一个字段的描述，两边同时变。
+
+## 工具接口长什么样
+
+所有工具都是同一个 `Tool` 接口的实现：
+
+```ts title="src/tools/types.ts"
+export interface Tool<Schema extends z.ZodType = z.ZodType> {
+  /** 工具名，模型用它来调用，必须唯一且稳定 */
+  name: string;
+  /** 工具描述——这是模型选择工具的主要依据，写清楚比写简短更重要 */
+  description: string;
+  /** 输入 schema */
+  schema: Schema;
+  /** 默认权限策略，具体是否放行还要过 PermissionManager */
+  permission: PermissionDecision;
+  /**
+   * 工具的主参数名，用于权限规则匹配
+   * 例如 Bash 的 command、Write 的 file_path
+   */
+  primaryParam?: string;
+  /** 执行工具 */
+  execute(input: z.infer<Schema>, ctx: ToolContext): Promise<ToolResult>;
+}
+```
+
+字段含义：
+
+<TypeTable
+  type={{
+    name: {
+      type: 'string',
+      description: '工具名，模型用它来调用，必须唯一且稳定',
+      required: true,
+    },
+    description: {
+      type: 'string',
+      description: '工具描述——模型选择工具的主要依据，写清楚比写简短更重要',
+      required: true,
+    },
+    schema: {
+      type: 'z.ZodType',
+      description: '输入 schema，由它派生 JSON Schema 与运行时校验',
+      required: true,
+    },
+    permission: {
+      type: "'allow' | 'ask' | 'deny'",
+      description: '默认权限策略，具体是否放行还要过 PermissionManager',
+      required: true,
+    },
+    primaryParam: {
+      type: 'string',
+      description: '工具的主参数名，用于权限规则匹配，例如 Bash 的 command、Write 的 file_path',
+    },
+    execute: {
+      type: '(input, ctx) => Promise<ToolResult>',
+      description: '执行工具。入参已通过 schema 校验，副作用全部通过 ctx 走',
+      required: true,
+    },
+  }}
+/>
+
+注意 `execute` 的入参类型是 `z.infer<Schema>`——schema 改一次，工具实现的入参类型自动跟着变，不需要手工维护第二份类型定义。
+
+另外注意工具本身「不碰终端、不管权限、不管会话」，它只描述「输入 → 输出」，所有副作用都通过 `ctx` 这个 `ToolContext` 走。这一点让工具可以脱离 agent 单独测试，后面每一章的测试都是这么写的。
+
+## ToolRegistry：注册、查重、转换
+
+工具集中管理在注册表里：
+
+```ts title="src/tools/registry.ts"
+export class ToolRegistry {
+  readonly #tools = new Map<string, Tool>();
+
+  register(tool: Tool): this {
+    if (this.#tools.has(tool.name)) {
+      throw new Error(`工具名重复：${tool.name}`);
+    }
+    this.#tools.set(tool.name, tool);
+    return this;
+  }
+
+  registerAll(tools: Tool[]): this {
+    for (const tool of tools) this.register(tool);
+    return this;
+  }
+
+  get(name: string): Tool | undefined {
+    return this.#tools.get(name);
+  }
+
+  has(name: string): boolean {
+    return this.#tools.has(name);
+  }
+
+  list(): Tool[] {
+    return [...this.#tools.values()];
+  }
+```
+
+几个设计取舍：
+
+- **查重在注册时做，不在调用时做。** 工具名重复意味着模型调用时无法区分这两个工具，所以 `register` 直接抛错。趁早失败比运行到一半才发现强。
+- **注册与调用分离。** 模型看到的「工具描述」和工具的实现解耦，工具可能来自内置代码、MCP 服务或插件，统一在这里装配。
+- **`register` / `registerAll` 返回 `this`**，方便链式调用。
+
+内置工具集中列在一个数组里：
+
+```ts title="src/tools/index.ts"
+export const BUILTIN_TOOLS: Tool[] = [
+  readTool,
+  writeTool,
+  editTool,
+  globTool,
+  grepTool,
+  bashTool,
+  todoTool,
+];
+```
+
+顺序不重要——模型是靠描述选工具的，不是靠顺序。但这份清单方便你「删掉一个试试」：少一个工具，模型的行为会立刻变化，这是理解工具设计最快的方式。
+
+## 验证：一份测试守住两层约束
+
+注册表产出的工具列表必须符合 Anthropic 的格式要求，这一层有测试守着：
+
+```ts title="test/tools.test.ts"
+test('注册表能为每个工具生成合法 JSON Schema', () => {
+  const tools = registry.toAnthropicTools();
+
+  assert.equal(tools.length, BUILTIN_TOOLS.length);
+
+  for (const tool of tools) {
+    assert.ok(tool.name.length > 0);
+    assert.ok(tool.description.length > 10, `${tool.name} 的描述太短，模型会用不好`);
+
+    const schema = tool.input_schema as Record<string, unknown>;
+    assert.equal(schema.type, 'object');
+    assert.ok(schema.properties, `${tool.name} 缺少 properties`);
+  }
+});
+```
+
+注意那句 `tool.description.length > 10`——它把「描述不能太短」变成了硬约束。描述质量没法用断言自动检查，但「描述至少得是个句子」可以。剩下的判断留给你在读代码时自己做。
+
+## primaryParam：给权限规则一个匹配对象
+
+权限规则要写成「Bash 且命令里包含 `rm -rf` 就拒绝」这种形式，就必须知道工具的哪个字段是「关键的那个」。
+
+`primaryParam` 就是声明这件事的：Bash 是 `command`，Write 和 Edit 是 `file_path`，Glob 是 `pattern`，Grep 是 `pattern`，TodoWrite 是 `todos`。
+
+```ts title="src/permissions.ts"
+  check(tool: Tool, input: Record<string, unknown>): PermissionCheck {
+    const primaryValue =
+      tool.primaryParam && typeof input[tool.primaryParam] === 'string'
+        ? (input[tool.primaryParam] as string)
+        : undefined;
+
+    for (const rule of this.#rules) {
+      if (rule.tool !== '*' && rule.tool !== tool.name) continue;
+
+      if (rule.pattern) {
+        if (!primaryValue) continue;
+        if (!new RegExp(rule.pattern, 'i').test(primaryValue)) continue;
+      }
+
+      return { decision: rule.decision, matched: rule };
+    }
+```
+
+有了它，一条规则就能写成「对 `Bash` 工具，检查 `command` 是否匹配某个正则」——用户配置规则时不用关心参数叫什么名字。
+
+注意 `primaryParam` 只是「权限规则去匹配的那个字段」，它**不代表**只有这个字段受管控。真正的规则化决策在[权限模型](/docs/engineering/permissions)那一章讲。
+
+## 小结
+
+- 工具描述是写给模型的提示词，不是写给同事的注释；字段名要有指向性。
+- 一份 zod schema 两处用：`z.toJSONSchema` 派生出给模型的入参格式，`schema.safeParse` 做运行时校验。
+- 注册表负责查重与转换，保证最终交给 API 的是合法的 `{ name, description, input_schema }` 三元组。
+- `Tool` 接口把工具的元数据、权限声明和执行逻辑固定成同一份契约。
+- `primaryParam` 告诉权限系统「该看哪个参数」，让规则不必知道字段名以外的东西。

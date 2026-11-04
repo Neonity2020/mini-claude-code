@@ -1,0 +1,237 @@
+---
+title: Agent 循环
+description: 用一个 while 循环把模型、工具和结果串起来，这是整个 coding agent 的心脏。
+---
+
+本章你会得到一个能自己读文件、改文件的 agent——核心只用一个 while 循环。
+
+<Callout type="info" title="先建立直觉">
+  Claude Code、Cursor、Aider、OpenAI 的 Codex CLI……所有 coding agent
+  的外壳都不一样，但内里都是同一个循环。框架只是替你把这个循环
+  包装得更顺手而已。
+</Callout>
+
+## 循环长什么样
+
+先把结论摆出来：
+
+```ts title="src/agent.ts（简化示意）"
+while (true) {
+  const message = await callModel();
+
+  // 模型不再要求调工具 -> 任务结束
+  if (message.stop_reason !== 'tool_use') break;
+
+  // 执行工具，把结果作为 user 消息喂回去
+  const results = await runTools(message);
+  messages.push({ role: 'user', content: results });
+}
+```
+
+就这么点东西。但要把它写对，有三个地方必须想清楚。
+
+## 一、模型和工具之间怎么传话
+
+这是最容易搞混的地方。Anthropic 的 API 协议规定：
+
+- 模型请求调用工具时，**assistant** 消息里会包含 `tool_use` 内容块
+- 你执行完工具后，必须把结果放进一条 **user** 消息，内容是 `tool_result` 块
+
+也就是说，**工具结果是以用户身份发回去的**，不是 assistant 消息。这不是约定俗成，是 API 硬性要求——写错了会直接报错。
+
+```ts title="src/agent.ts"
+const toolUses = assistantMessage.content.filter(
+  (block): block is ToolUseBlock => block.type === 'tool_use',
+);
+
+// 没有工具调用 -> 这一轮结束
+if (assistantMessage.stop_reason !== 'tool_use' || toolUses.length === 0) {
+  return;
+}
+
+// 串行执行，避免写入竞争和确认提示交错。
+const results: ToolResultBlockParam[] = [];
+for (const toolUse of toolUses) results.push(await this.#runTool(toolUse));
+
+// 工具结果必须作为 user 消息回传，这是 Anthropic API 的协议要求
+this.#messages.push({ role: 'user', content: results });
+```
+
+同一轮中的工具按顺序执行，避免写入竞争和多个确认提示交错。所有结果仍放在同一条 user 消息中。
+
+<Callout type="idea" title="为什么不是并行">
+  最初这里是 `Promise.all` 并行执行，省一点时间。但很快就发现两个问题：
+  一是模型在同一轮里让两个工具写同一个路径会互相覆盖；二是多个工具
+  同时需要确认时，终端里的确认提示会交错，用户根本分不清哪个是哪个。
+  工具调用之间本来就有顺序依赖（先读后改），串行换来的是确定性，
+  这笔交易很划算。
+</Callout>
+
+## 二、怎么知道这一轮该结束了
+
+判断依据是 `stop_reason`。常见的几个值：
+
+| stop_reason | 含义 | 循环该怎么办 |
+| --- | --- | --- |
+| `tool_use` | 模型要求调用工具 | 执行工具，喂回结果，继续 |
+| `end_turn` | 模型自己说完了 | 结束循环 |
+| `max_tokens` | 输出撞到 token 上限 | 结束循环（通常要提示用户） |
+| `stop_sequence` | 命中了自定义停止串 | 结束循环 |
+
+所以「结束条件」不是「模型没调工具」，而是「`stop_reason` 不是 `tool_use`」。这两者在正常情况下等价，但 `max_tokens` 的情况能让你看清差别——那不是任务完成，是被硬生生切断的。
+
+## 三、工具失败了怎么办
+
+这是新手最容易写错的地方。工具执行失败时，**不要抛异常终止整个 agent**。
+
+模型需要知道「这个操作失败了，失败原因是 X」，才能自己换策略：换个路径重试、改用别的工具、或者直接告诉你做不到。
+
+```ts title="src/agent.ts"
+// 2. 入参校验
+const parsed = tool.schema.safeParse(input);
+if (!parsed.success) {
+  const result: ToolResult = {
+    content: `参数不合法：${parsed.error.issues
+      .map((issue) => `${issue.path.join('.') || '(根)'} — ${issue.message}`)
+      .join('; ')}`,
+    isError: true,
+  };
+  this.#options.onToolEnd?.(name, result);
+  return this.#toToolResult(toolUse.id, result);
+}
+```
+
+校验失败、权限被拒、文件不存在、命令退出码非零——全都是同一种处理：**把错误包装成一条正常的 `tool_result`，带上 `is_error: true` 送回模型。**
+
+<Callout type="idea" title="工具错误是信息，不是事故">
+  换个角度想：模型看不到你的终端，它只能看到你回给它的 `tool_result`。
+  一条写得清楚的错误信息（「文件不存在：src/app.ts」）就是给模型的
+  情报，让它立刻就能纠正方向。含糊的报错（「出错了」）才是真正的浪费。
+</Callout>
+
+## 完整的循环
+
+把三部分合起来，是 `Agent.run()` 的真实实现：
+
+```ts title="src/agent.ts"
+async run(userInput: string): Promise<void> {
+  this.#controller = new AbortController();
+  const checkpoint = this.#messages.slice();
+  this.#messages.push({ role: 'user', content: userInput });
+  try {
+
+  const maxTurns = this.#options.maxTurns ?? 50;
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    await this.#maybeCompact();
+
+    const assistantMessage = await this.#callModel();
+    const reasoning = (assistantMessage as typeof assistantMessage & { reasoning_content?: string }).reasoning_content;
+    this.#messages.push({ role: 'assistant', content: assistantMessage.content, ...(reasoning !== undefined ? { reasoning_content: reasoning } : {}) });
+
+    const toolUses = assistantMessage.content.filter(
+      (block): block is ToolUseBlock => block.type === 'tool_use',
+    );
+
+    // 没有工具调用 -> 这一轮结束
+    if (assistantMessage.stop_reason !== 'tool_use' || toolUses.length === 0) {
+      return;
+    }
+
+    // 串行执行，避免写入竞争和确认提示交错。
+    const results: ToolResultBlockParam[] = [];
+    for (const toolUse of toolUses) results.push(await this.#runTool(toolUse));
+
+    // 工具结果必须作为 user 消息回传，这是 Anthropic API 的协议要求
+    this.#messages.push({ role: 'user', content: results });
+  }
+
+  throw new Error(`已达到最大轮数限制（${maxTurns}），强制结束。`);
+  } catch (error) {
+    // Discard incomplete tool exchanges so the next request has valid history.
+    this.#messages.splice(0, this.#messages.length, ...checkpoint);
+    throw error;
+  }
+}
+```
+
+这版比「教科书版本」多了两处东西，都是踩过坑才加的：
+
+**每轮重置 `#controller`。** 取消信号是一次性的——用户按过一次 Ctrl+C 之后，
+这个 `AbortController` 就永远是 aborted 状态。所以每轮开始都要造一个新的，
+否则第二轮请求会立刻被自己取消掉。
+
+**`checkpoint` 快照与失败回滚。** 这是协议正确性问题，不是体验问题：
+
+一轮里如果模型请求了 3 个工具，你执行完第 1 个、第 2 个抛异常了，
+此时历史里留下的是「assistant 请求了 3 个工具，但只回传了 1 个结果」——
+**协议不完整**。下一次请求带着这段历史发出去，API 会直接拒绝。
+
+回滚就是把历史恢复成这一轮开始之前的样子，让「未完成的一次工具交换」
+彻底消失。
+
+<Callout type="warn" title="协议错误会污染整个会话">
+  agent 的一次失败，可能毁掉后面所有对话——因为历史是累积的。
+  「出错时回滚到干净状态」不是锦上添花，是让 agent 能继续用下去的底线。
+</Callout>
+
+`reasoning_content` 是给推理模型准备的：思维链内容单独存在消息上，
+不混进 `content` 块里，回传时也要原样带上。
+
+`maxTurns` 这个上限很重要。没有它，一个陷入死循环的 agent 会一直烧你的钱——比如模型反复用 Edit 替换同一段内容，每次都因为「找不到 old_string」失败，但它就是不停。50 轮是个经验值：正常任务通常在 5–15 轮内完成。
+
+<Callout type="warn" title="maxTurns 是成本闸门，不是形式">
+  它防的不是「任务太难」，是「模型陷入循环」。真实场景里更值得设的
+  是 token 预算——因为一轮可能产生几万 token，轮数少不代表花得少。
+</Callout>
+
+## 会话历史就是全部状态
+
+注意 `run()` 里没有别的东西了。没有「任务状态对象」，没有「步骤计数器」，没有「计划变量」。
+
+agent 的所有记忆都在 `this.#messages` 这一个数组里。模型看到的历史 = 你看到的历史。这也是为什么上下文管理（[上下文管理](/docs/engineering/context)）如此重要：历史既是记忆，也是负担。
+
+<Callout type="idea" title="为什么这既是优点也是隐患">
+  优点是状态统一、没有同步问题——你不需要维护两份「模型以为的进度」和
+  「真实进度」。隐患是每一轮都要把整个历史重新发一遍，历史越长越慢越贵。
+  后面讲压缩策略时，我们会回到这里。
+</Callout>
+
+## 验证
+
+跑一个真实任务试试。下面是 `examples/mini-claude-code` 里的实际用法：
+
+```bash
+cd examples/mini-claude-code
+export LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=sk-ant-xxx
+pnpm start
+```
+
+然后输入：
+
+```
+› 看看 src/agent.ts 里 agent 循环是怎么写的
+```
+
+你应该能看到模型先调用 `Read` 工具，读完文件后自己总结出循环结构。注意观察终端里 `⏺ Read src/agent.ts` 那一行——那就是一次工具调用被发起。
+
+再试一个需要多步的任务：
+
+```
+› 在 src/tools/ 下新建一个叫 rename.ts 的文件，内容是 TODO
+```
+
+这个任务会触发：Glob 或 Read 探路 → Write 写文件 → 结束。中间你会看到工具结果被回传，模型再决定下一步。
+
+## 小结
+
+- agent 的本质是一个 while 循环：请求模型 → 执行工具 → 回传结果 → 重复
+- 工具结果必须以 **user** 消息回传，每条 `tool_result` 要用 `tool_use_id` 对应上
+- 用 `stop_reason` 判断结束，而不是靠猜
+- 工具失败要包装成正常的 `tool_result` + `is_error`，让模型自己纠正
+- `maxTurns` 是防止无限循环烧钱的闸门
+- agent 的全部状态就是 `messages` 数组
+
+下一章我们把「请求模型」这一步做细：怎么让输出像打字一样逐字出现，以及
+流式模式下工具参数是怎么被拼装出来的。

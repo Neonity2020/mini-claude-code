@@ -1,0 +1,265 @@
+---
+title: 命令执行
+description: Bash 工具的实现细节：spawn 调用、超时控制、输出截断与退出码回传。
+---
+
+本章你会得到一个受控的 Bash 工具：命令在固定的工作目录里跑，超时会被杀，输出会被截断，退出码会告诉模型这次到底成功没有。
+
+## 用 spawn，不拼字符串
+
+```ts title="src/tools/bash-tool.ts"
+import { spawn } from 'node:child_process';
+```
+
+```ts title="src/tools/bash-tool.ts"
+const bashSchema = z.object({
+  command: z.string().describe('要在工作目录中执行的 shell 命令'),
+  description: z.string().optional().describe('用一句话说明这个命令要做什么，用于日志展示'),
+  timeout: z.number().int().min(1).max(600_000).optional().describe('超时时间（毫秒），默认 120000'),
+});
+```
+
+执行命令用的是 `spawn('bash', ['-lc', command])`，而不是更常见的 `exec`。三个理由：
+
+**第一，不在 JS 里拼命令字符串。** `exec` 只有一个字符串参数，`exec('echo ' + userInput)` 会把用户输入拼进 shell 程序文本里——引号、`$`、反引号、分号全都变成了注入点。`spawn` 接受参数数组，整条命令作为**一个 argv 元素**传下去，中间没有任何 JS 侧的字符串拼接。
+
+<Callout type="error" title="为什么不能把用户输入直接拼进 shell 命令">
+  命令字符串一旦拼错一个引号，用户输入里的 `; rm -rf ~` 就是一条独立命令。
+  更隐蔽的情况是文件名：`git checkout feature/$(whoami)` 这种拼接看着无害，
+  但模型给出的路径你无法逐个审计。正确做法是**不拼**——把完整命令作为
+  argv 的单个元素传给 `spawn`，需要传值的地方用 `spawn` 的独立参数位，
+  让 shell 根本碰不到那些值。
+</Callout>
+
+**第二，超时可控。** `exec` 只能靠 Node 的 `timeout` 选项，它发的是 `SIGTERM`——子进程可以捕获信号然后赖着不走。`spawn` 让我们自己控制：到点直接 `SIGKILL`，进程一定死。
+
+**第三，输出量自己掌控。** `exec` 有个 1MB 的 `maxBuffer` 默认值，超了会直接抛错，输出被硬生生砍掉。`spawn` 里我们自己接收数据流，截断策略可以自己定——比如保留头尾。
+
+说清楚取舍：`bash -lc` 里的 `-l`（登录 shell）和 `-c`（执行后面的命令串）意味着**命令仍然由 bash 解释**。我们要的就是这个——管道、`&&`、通配符都是 shell 语法。所以真正的防线不是参数转义，而是权限层：默认 `ask`，危险命令会被规则拦下，见[权限模型](/docs/engineering/permissions)。
+
+## 完整实现
+
+```ts title="src/tools/bash-tool.ts"
+export const bashTool: Tool<typeof bashSchema> = {
+  name: 'Bash',
+  description:
+    '在工作目录中执行一条 shell 命令，返回 stdout 和 stderr。' +
+    '适用于 git、npm、构建、测试等操作。命令输出会被截断。',
+  schema: bashSchema,
+  permission: 'ask',
+  primaryParam: 'command',
+  async execute(input, ctx) {
+    const timeout = input.timeout ?? 120_000;
+    const workdir = resolvePath(ctx.cwd, '.');
+
+    if (!isInside(ctx.cwd, workdir)) {
+      return { content: `拒绝在 ${workdir} 之外执行命令。`, isError: true };
+    }
+
+    return await new Promise((resolve) => {
+      const child = spawn('bash', ['-lc', input.command], {
+        cwd: workdir,
+        signal: ctx.signal,
+        env: { ...process.env, GIT_PAGER: 'cat', PAGER: 'cat' },
+      });
+
+      let stdout = '';
+      let stderr = '';
+      let timedOut = false;
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }, timeout);
+
+      child.stdout.on('data', (chunk: Buffer) => {
+        stdout += chunk.toString();
+      });
+
+      child.stderr.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+
+      child.on('error', (error) => {
+        clearTimeout(timer);
+        resolve({ content: `命令启动失败：${error.message}`, isError: true });
+      });
+
+      child.on('close', (code) => {
+        clearTimeout(timer);
+
+        if (timedOut) {
+          resolve({
+            content: `命令超时（${timeout}ms）被终止。\n${truncate(stdout, 5_000)}`,
+            isError: true,
+          });
+          return;
+        }
+
+        const parts: string[] = [];
+        if (stdout.trim()) parts.push(truncate(stdout, 20_000).trimEnd());
+        if (stderr.trim()) parts.push(`[stderr]\n${truncate(stderr, 10_000).trimEnd()}`);
+        if (parts.length === 0) parts.push('(命令没有产生输出)');
+
+        parts.push(`[exit code: ${code ?? 'null'}]`);
+
+        resolve({
+          content: parts.join('\n\n'),
+          isError: code !== 0,
+        });
+      });
+    });
+  },
+};
+```
+
+## 超时：到点就杀
+
+默认超时 120000 毫秒，模型可以用 `timeout` 参数覆盖，但被 schema 限制在 1 到 600000 毫秒之间。
+
+超时的处理是 `SIGKILL`：
+
+```ts title="src/tools/bash-tool.ts"
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill('SIGKILL');
+      }, timeout);
+```
+
+`SIGKILL` 不给进程任何收尾机会——它不会跑 `atexit` 处理，不会 flush 缓冲，不会执行 `trap`。这正是你要的：一个卡死的 `npm install` 或者一个等着输入的交互式命令，不能占着这个 agent 的回合不放。
+
+`SIGKILL` 还有一个副作用值得记住：**父进程拿不到子进程的退出码**。所以代码里用 `timedOut` 这个标志位记录「是我杀的」，在 `close` 事件里先判断它，再决定返回什么：
+
+```ts title="src/tools/bash-tool.ts"
+        if (timedOut) {
+          resolve({
+            content: `命令超时（${timeout}ms）被终止。\n${truncate(stdout, 5_000)}`,
+            isError: true,
+          });
+          return;
+        }
+```
+
+超时时 stdout 只保留 5000 字符——这时候的输出多半是刷屏的进度条，没什么价值。
+
+还有一个细节：`signal: ctx.signal` 把 agent 的取消信号传给了子进程。你按 Ctrl+C 中断 agent 时，正在跑的命令会跟着被干掉，而不是继续在后台跑着。
+
+## 输出截断
+
+正常结束时，stdout 截到 20000 字符，stderr 截到 10000 字符：
+
+```ts title="src/tools/bash-tool.ts"
+        const parts: string[] = [];
+        if (stdout.trim()) parts.push(truncate(stdout, 20_000).trimEnd());
+        if (stderr.trim()) parts.push(`[stderr]\n${truncate(stderr, 10_000).trimEnd()}`);
+        if (parts.length === 0) parts.push('(命令没有产生输出)');
+```
+
+截断用的是 `fs-utils.ts` 里的 `truncate()`，它保留头尾并在中间留一行省略提示。构建日志通常是「前面几十行有用、后面几十行有用、中间几千行是编译进度」，保留头尾正好。
+
+stderr 单独加 `[stderr]` 前缀，是为了模型能一眼分辨：这两段是错误信息，不是正常输出。模型看到 `[stderr]` 加上非零退出码，通常会去修问题，而不是重跑同一条命令。
+
+命令没有输出时也要给模型一个明确答复——`(命令没有产生输出)`。返回空字符串会让模型怀疑是工具坏了。
+
+成功路径的测试：
+
+```ts title="test/tools.test.ts"
+test('Bash 执行命令并返回输出', async () => {
+  await withSandbox(async (cwd) => {
+    const result = await registry.get('Bash')!.execute(
+      { command: 'echo hello-mcc' },
+      makeContext(cwd),
+    );
+
+    assert.ok(!result.isError, result.content);
+    assert.match(result.content, /hello-mcc/);
+  });
+});
+```
+
+## 退出码：失败必须让模型知道
+
+```ts title="src/tools/bash-tool.ts"
+        parts.push(`[exit code: ${code ?? 'null'}]`);
+
+        resolve({
+          content: parts.join('\n\n'),
+          isError: code !== 0,
+        });
+```
+
+**退出码既写进文本，也写进 `isError`。** 两个都要：
+
+- `isError: code !== 0` 是结构化信号，会变成 tool_result 块的 `is_error` 字段。
+- `[exit code: 3]` 是给模型看的文本，即使模型读不懂结构，也能从文本里看到数字。
+
+测试用例验证的就是这条路径：
+
+```ts title="test/tools.test.ts"
+test('Bash 失败时标记 isError', async () => {
+  await withSandbox(async (cwd) => {
+    const result = await registry.get('Bash')!.execute(
+      { command: 'exit 3' },
+      makeContext(cwd),
+    );
+
+    assert.equal(result.isError, true);
+    assert.match(result.content, /exit code: 3/);
+  });
+});
+```
+
+如果不把失败标记出来，模型会以为命令跑成功了，然后基于「成功」的假设继续往下走——比如认为测试通过了、依赖装好了。这类幻觉比直接报错危险得多。
+
+## 环境变量：别让分页器挂住
+
+```ts title="src/tools/bash-tool.ts"
+        env: { ...process.env, GIT_PAGER: 'cat', PAGER: 'cat' },
+```
+
+`git log`、`git diff`、`git show` 在输出量大的时候会启动分页器（less）。分页器需要 TTY，在 agent 这种非交互环境里，它要么立刻退出，要么干脆等一个永远不会来的按键——表现就是**命令挂住直到超时**。
+
+把 `GIT_PAGER` 和 `PAGER` 都设成 `cat`，等于告诉所有工具「别分页，全部输出」，命令立刻返回。
+
+注意这里用的是 `{ ...process.env, ... }`：保留父进程的环境变量（`PATH`、`HOME` 这些必须有），只覆盖分页器相关的两个。
+
+## 危险命令不在这一章
+
+这一章只讲「怎么执行」。要不要执行，是另一层的事：
+
+- `permission: 'ask'` —— 默认每次都要你点头。
+- `primaryParam: 'command'` —— 权限规则检查的是命令本身，所以规则可以写成「命令里包含 `rm -rf` 就拒绝」。
+- 危险命令的具体判定逻辑，见[权限模型](/docs/engineering/permissions)。
+
+这一层为什么不能省：工具描述是写给模型的，模型可能被提示词注入（prompt injection）诱导去执行危险命令。**指望模型自觉是不够的，必须有一道在模型之外的、不听模型说话的程序化关卡。**
+
+这里有一个容易被忽略的事实：**连只读命令也要确认。**
+
+曾经规则集里有一条「只读命令白名单」，把 `ls`、`cat`、`git status` 这类命令直接放行。
+后来这条规则被删掉了——因为「看起来只读」这个判断本身就不可靠：`git status` 会读配置、
+`cat` 可以读任何文件、`grep` 能扫全仓库。一条按命令名匹配的放行规则，等于给
+提示词注入开了一道口子。
+
+现在的规则是：除了明确被 `deny` 的危险命令，**其余 Bash 一律 `ask`**。
+
+这条行为变化有测试兜着：
+
+```ts title="test/tools.test.ts"
+test('Bash 复合命令和只读命令都需要确认', async () => {
+```
+
+<Callout type="idea" title="安全设计的默认方向">
+  规则集从「白名单放行」改成「默认询问、显式拒绝」，代价是多点几下，
+  收益是新增一条工具规则时不会意外开出个后门。做安全设计时，
+  默认值应该选「更保守的那个」。
+</Callout>
+
+## 小结
+
+- 用 `spawn` 传参数数组，不在 JS 里拼命令字符串；命令本身仍走 bash，这是有意的取舍。
+- 超时默认 120000ms，用 `SIGKILL` 硬杀，并用标志位区分「超时被杀」和「命令自己失败」。
+- stdout 截 20000、stderr 截 10000，空输出也给出明确回复。
+- 退出码同时写进文本和 `isError`，模型必须能分清成功和失败。
+- `GIT_PAGER=cat`、`PAGER=cat` 避免分页器把命令挂住。
+- 只读命令也要确认——白名单放行等于给提示词注入开口子。
+- 执行归这一章，放行归[权限模型](/docs/engineering/permissions)。

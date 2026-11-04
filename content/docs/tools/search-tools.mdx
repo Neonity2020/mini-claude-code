@@ -1,0 +1,319 @@
+---
+title: 搜索工具
+description: 自己实现 Glob 和 Grep：模式匹配、正则搜索、输出截断与三个工具的配合。
+---
+
+本章你会得到两个搜索工具：按文件名模式找文件的 Glob，和按正则搜内容的 Grep，它们共用同一套遍历与截断逻辑。
+
+## Glob：自己写一个够用的模式匹配
+
+Glob 干的事很简单：遍历目录，把文件路径和你的模式比一比。
+
+先看遍历。它会跳过一批不该进搜索范围的目录：
+
+```ts title="src/tools/search-tools.ts"
+/** 默认忽略的目录 */
+const IGNORED_DIRS = new Set([
+  'node_modules',
+  '.git',
+  '.next',
+  'dist',
+  'build',
+  '.turbo',
+  'coverage',
+  '.venv',
+  '__pycache__',
+]);
+```
+
+```ts title="src/tools/search-tools.ts"
+async function walk(root: string, cwd: string): Promise<string[]> {
+  const files: string[] = [];
+
+  async function visit(dir: string): Promise<void> {
+    let entries;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') && entry.name !== '.') {
+        if (IGNORED_DIRS.has(entry.name)) continue;
+      }
+      if (IGNORED_DIRS.has(entry.name)) continue;
+
+      const full = path.join(dir, entry.name);
+      if (!isInside(cwd, full)) continue;
+
+      if (entry.isDirectory()) {
+        await visit(full);
+      } else if (entry.isFile()) {
+        files.push(full);
+      }
+    }
+  }
+
+  await visit(root);
+  return files;
+}
+```
+
+三点值得注意：
+
+- **忽略清单是硬编码的。** `node_modules` 和 `.git` 是两个最大的噪音源，进搜索结果只会让模型在无关文件里瞎找。
+- **读目录失败就跳过，不抛错。** 权限不足的目录、被删掉的目录，都不该让整个搜索失败。
+- **搜索入口拒绝路径中的符号链接。** 遍历时不跟随符号链接；这些检查不是操作系统级沙箱。
+
+顺便一提，代码里对 `.` 开头的条目有一段特判，但因为紧接着还有一次同样的忽略清单判断，实际效果是「隐藏目录里只有被列入清单的那几个会被跳过」。想跳过全部隐藏目录，把那两行合并成一次判断就行。
+
+### 模式怎么变成正则
+
+模式匹配是自己实现的：
+
+```ts title="src/tools/search-tools.ts"
+/**
+ * 把 glob 模式（只支持 * 和 **）编译成正则。
+ *
+ * 不引入完整的 glob 库，是因为教学目标是让大家看清匹配逻辑本身，
+ * 而不是学会调 API。
+ */
+function globToRegExp(pattern: string): RegExp {
+  let regex = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const char = pattern.charAt(i);
+    if (char === '*') {
+      if (pattern.charAt(i + 1) === '*') {
+        regex += '.*';
+        i++;
+        if (pattern.charAt(i + 1) === '/') i++;
+      } else {
+        regex += '[^/]*';
+      }
+    } else if (char === '?') {
+      regex += '[^/]';
+    } else if ('.+^${}()|[]\\'.includes(char)) {
+      regex += `\\${char}`;
+    } else {
+      regex += char;
+    }
+  }
+  return new RegExp(`^${regex}$`);
+}
+```
+
+逐条翻译：
+
+| 模式 | 编译成 | 含义 |
+| --- | --- | --- |
+| `*` | `[^/]*` | 匹配任意多个字符，但不跨目录分隔符 |
+| `**` | `.*` | 匹配任意多个字符，可以跨目录 |
+| `?` | `[^/]` | 匹配单个字符 |
+| 其他 | 原样或转义 | `.` 转成 `\.`，避免被当成正则的「任意字符」 |
+
+`**` 后面紧跟的 `/` 会被一起吃掉，所以 `**/*.ts` 编译出来是 `^.*[^/]*\.ts$`：`.*` 跨目录吃掉 `src/components/`，`[^/]*` 吃掉最后一段文件名，`\.ts` 收尾。
+
+**为什么不用第三方 glob 库？** 源码注释里写得很直接：不引入完整的 glob 库，是因为教学目标是让大家看清匹配逻辑本身，而不是学会调 API。真实项目里用 `fast-glob` 当然更省事（还支持 `{ts,tsx}` 这样的花括号展开），但那样你永远搞不清 `**` 到底跨了几层目录。
+
+代价要认下来：这套实现不支持 `{a,b}`、字符类 `[abc]`、取反 `!`、问号后缀 这些扩展语法。工具描述里也如实告诉了模型这一点——「本实现仅支持 `*` 与 `**`」。
+
+### 匹配与排序
+
+```ts title="src/tools/search-tools.ts"
+  async execute(input, ctx) {
+    const searchRoot = resolvePath(ctx.cwd, input.path ?? '.');
+
+    if (!(await isSafePath(ctx.cwd, searchRoot))) {
+      return { content: `拒绝搜索工作目录之外的路径：${searchRoot}`, isError: true };
+    }
+
+    const files = await walk(searchRoot, ctx.cwd);
+    const regex = globToRegExp(input.pattern);
+
+    const matched = files.filter((file) => {
+      const relative = path.relative(ctx.cwd, file).split(path.sep).join('/');
+      return regex.test(relative) || regex.test(path.basename(file));
+    });
+
+    if (matched.length === 0) {
+      return { content: `没有匹配 \`${input.pattern}\` 的文件。` };
+    }
+
+    // 按最近修改排序，让模型优先看到刚被改过的文件
+    const withStat = await Promise.all(
+      matched.map(async (file) => ({
+        file,
+        mtime: await fs.stat(file).then((s) => s.mtimeMs).catch(() => 0),
+      })),
+    );
+    withStat.sort((a, b) => b.mtime - a.mtime);
+```
+
+两个细节：
+
+- **相对路径和文件名都试一次。** `regex.test(relative) || regex.test(path.basename(file))`——所以 `*.ts` 既能匹配 `src/a.ts`（相对路径匹配不上，文件名匹配得上），也能匹配 `a.ts`。测试用例就是这么用的：
+
+```ts title="test/tools.test.ts"
+test('Glob 能匹配到文件', async () => {
+  await withSandbox(async (cwd) => {
+    await fs.writeFile(path.join(cwd, 'x.ts'), '');
+    await fs.writeFile(path.join(cwd, 'y.js'), '');
+
+    const result = await registry.get('Glob')!.execute(
+      { pattern: '**/*.ts' },
+      makeContext(cwd),
+    );
+
+    assert.match(result.content, /x\.ts/);
+    assert.doesNotMatch(result.content, /y\.js/);
+  });
+});
+```
+
+- **按最近修改排序。** 模型经常是在改一个刚被触碰过的文件，把最新的排在前面能显著提高命中率——省掉好几次 Grep 和 Read 的往返。
+
+## Grep：正则搜内容
+
+Grep 的遍历逻辑和 Glob 完全一致，复用同一个 `walk`。区别在匹配与输出。
+
+搜索入口的沙箱检查也一样：`path` 参数解析出来的起点必须先过 `isSafePath`，否则工作目录里的一个符号链接就能成为搜索的跳板（原理见[文件工具](/docs/tools/file-tools)）。
+
+```ts title="src/tools/search-tools.ts"
+  async execute(input, ctx) {
+    const searchRoot = resolvePath(ctx.cwd, input.path ?? '.');
+
+    if (!(await isSafePath(ctx.cwd, searchRoot))) {
+      return { content: `拒绝搜索工作目录之外的路径：${searchRoot}`, isError: true };
+    }
+
+    // ...
+    let regex: RegExp;
+    try {
+      regex = new RegExp(input.pattern, 'i');
+    } catch (error) {
+      return { content: `正则表达式无效：${(error as Error).message}`, isError: true };
+    }
+
+    const files = await walk(searchRoot, ctx.cwd);
+    const fileRegex = input.glob ? globToRegExp(input.glob) : null;
+    const headLimit = input.head_limit ?? 100;
+
+    const results: string[] = [];
+
+    for (const file of files) {
+      if (results.length >= headLimit) break;
+
+      if (fileRegex) {
+        const relative = path.relative(ctx.cwd, file).split(path.sep).join('/');
+        if (!fileRegex.test(relative) && !fileRegex.test(path.basename(file))) continue;
+      }
+
+      // 二进制文件跳过，否则会读出乱码
+      const buffer = await fs.readFile(file);
+      if (buffer.includes(0)) continue;
+
+      const lines = buffer.toString('utf8').split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i] ?? '';
+        if (!regex.test(line)) continue;
+
+        const relative = path.relative(ctx.cwd, file).split(path.sep).join('/');
+        results.push(
+          input.output_mode === 'files'
+            ? relative
+            : `${relative}:${i + 1}:${line.trim().slice(0, 200)}`,
+        );
+
+        if (results.length >= headLimit) break;
+      }
+    }
+```
+
+几个行为要记住：
+
+- **正则永远大小写不敏感。** `new RegExp(input.pattern, 'i')` 里的 `i` 标志是写死的，模型没法要求大小写敏感。
+- **正则写错不会崩。** `try/catch` 捕获编译错误，把错误信息回传给模型，模型换个写法再来。
+- **`output_mode` 决定输出粒度。** `files` 只给文件名，`content`（默认）给 `路径:行号:内容`，正好是 `grep -n` 的格式。
+- **单行内容截到 200 字符。** 一行 minified 的 JS 可能几万字符，不截的话一行就能撑爆结果。
+- **二进制文件跳过。** 靠 `buffer.includes(0)` 判断——内容里有 NUL 字节就当二进制，直接跳过。这一步能避免把图片、字体、`.wasm` 读成乱码塞进上下文。
+- **`glob` 参数可以缩小范围。** 它复用了 `globToRegExp`，所以 `glob: '*.ts'` 这样的简单过滤是支持的。
+
+测试用例验证的是行号格式：
+
+```ts title="test/tools.test.ts"
+test('Grep 能找到匹配行并给出行号', async () => {
+  await withSandbox(async (cwd) => {
+    await fs.writeFile(path.join(cwd, 'g.ts'), 'line1\nconst target = 1;\nline3\n');
+
+    const result = await registry.get('Grep')!.execute(
+      { pattern: 'target' },
+      makeContext(cwd),
+    );
+
+    assert.match(result.content, /g\.ts:2/);
+  });
+});
+```
+
+## 截断：两层阀门
+
+Grep 有两道限制，先说清楚原因。
+
+`head_limit` 默认 100，限制的是**结果条数**——匹配行（`content` 模式）或文件名（`files` 模式）。外层和内层循环都会检查这个上限。
+
+第二道是字符数：
+
+```ts title="src/tools/fs-utils.ts"
+export function truncate(text: string, maxLength: number): string {
+  if (text.length <= maxLength) return text;
+
+  const headLength = Math.floor(maxLength * 0.6);
+  const tailLength = maxLength - headLength;
+  const omitted = text.length - headLength - tailLength;
+
+  return [
+    text.slice(0, headLength),
+    `\n... [已省略 ${omitted.toLocaleString('en-US')} 字符] ...\n`,
+    text.slice(text.length - tailLength),
+  ].join('');
+}
+```
+
+Grep 用的是 `truncate(results.join('\n'), 20_000)`。
+
+<Callout type="warn" title="一次 grep 命中上万行会直接撑爆上下文">
+  在一个真实项目里搜 `import` 或者 `console.log`，命中上万行是家常便饭。
+  这些内容塞回上下文，轻则浪费掉几万 token，重则把窗口撑爆、后面的对话全丢。
+  所以截断策略是**保留头尾**：头 60% 给你看最早的命中，尾 40% 给你看最后的命中，
+  中间用一行「已省略 N 字符」占位。为什么留尾？因为最后的匹配往往最接近
+  模型当前要找的地方。
+</Callout>
+
+被截断时模型会看到省略提示，它知道「还有更多内容」，可以换个更精确的模式重搜。这是截断和「静默丢数据」的区别——静默丢数据会让模型误以为「全仓库只有这几处」。
+
+## 三个工具怎么配合
+
+这是工具系统里最实用的部分。三个工具回答的是三个不同的问题：
+
+| 工具 | 回答的问题 | 匹配对象 |
+| --- | --- | --- |
+| Glob | 这个文件**在哪** | 文件名 |
+| Grep | 这个符号**在哪被用到** | 文件内容 |
+| Read | 这个文件里**写了什么** | 指定行范围 |
+
+Read 的分段读取和行号输出见[文件工具](/docs/tools/file-tools)。
+
+典型的一次协作是这样的：模型先用 Glob 找到 `src/tools/registry.ts`，再用 Grep 搜 `toAnthropicTools` 找到它被调用的位置，然后 Read 那一段源码确认上下文。
+
+反过来用也很常见：模型先用 Grep 搜 `createToolRegistry` 找到三处定义，但不知道它们分别在哪个文件——Grep 的结果本身就带着路径和行号，模型直接 Read 那一行就行。
+
+工具分工清晰，模型才不会拿 Read 去搜索、用 Grep 去列文件。
+
+## 小结
+
+- glob 模式自己编译成正则：`*` 不跨目录、`**` 跨目录，这是够用且看得懂的选择。
+- 忽略 `node_modules` 等目录、按最近修改排序，是让搜索结果「少而准」的两个关键动作。
+- Grep 输出 `路径:行号:内容`，跳过二进制文件，单行截到 200 字符。
+- `head_limit` 和 `truncate` 两道阀门防住上下文被撑爆，截断时保留头尾。
+- Glob 找文件、Grep 找符号、Read 读内容——三个工具各管一件事，配合起来才是完整的代码导航。

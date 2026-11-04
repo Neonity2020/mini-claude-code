@@ -1,0 +1,458 @@
+---
+title: 打包发布
+description: 把 Mini Claude Code 从能跑变成能装进别人电脑的工具：构建、配置与测试。
+---
+
+本章不讲新功能，只讲一件事：怎么把现在这个「你自己机器上能跑的脚本」变成
+「别人 `npm i -g` 就能用、崩了能排查、花钱能控制」的工具。
+
+## 从玩具到工具，差的是这些
+
+| 能力 | 现在 | 要补的 |
+| --- | --- | --- |
+| 打包入口 | `bin` 和 `tsconfig.build.json` 就位，`pnpm build` 能产出 `dist/` | 发布前补 `chmod +x` 和 `files` |
+| 版本约束 | 无 | `engines.node` |
+| 凭据 | 硬要求环境变量 | 让不熟 shell 的用户也能配上 |
+| 崩溃 | REPL 里 catch 住不退出 | 区分「可恢复」和「不可恢复」 |
+| 可观测 | 只有终端输出 | 日志、token 用量、每轮耗时 |
+| 成本 | 默认跑满 50 轮 | 可配置的上限 |
+| 测试 | 11 个工具用例 | 循环也要能测 |
+
+## 打包与入口
+
+`package.json` 已经声明好了入口：
+
+```json title="examples/mini-claude-code/package.json"
+  "bin": {
+    "mini-claude-code": "./dist/index.js"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "tsx src/index.ts",
+    "test": "node --import tsx --test test/tools.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json"
+  },
+```
+
+但注意两件事：
+
+1. `build` 指向 `tsconfig.build.json`，它和 `tsconfig.json` 是两个文件。
+   基础配置是给类型检查用的：
+
+```json title="examples/mini-claude-code/tsconfig.json"
+    "noEmit": true,
+    ...
+  "include": ["src/**/*.ts"]
+```
+
+   `noEmit: true` 意味着 `tsc` 只做检查、不产出任何文件。要能构建，
+   需要一个继承基础配置、把 `noEmit` 改成产出、并指定 `outDir` 的构建专用配置：
+
+```json title="examples/mini-claude-code/tsconfig.build.json"
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": false,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts"]
+}
+```
+
+   `rootDir: "src"` 是必须的：少了它，产物会落在 `dist/src/index.js`，`bin` 字段就指空了。
+   `include` 也必须显式写一遍——`extends` 里的 `include` 不会被自动合并，
+   不写就会沿用父配置（这里恰好一致，但显式写更稳）。
+   `exclude` 则是为了不把测试文件也编进产物。
+
+   <Callout type="idea" title="为什么要拆成两个 tsconfig">
+     类型检查和打包的诉求是相反的。检查时你希望覆盖**所有**源码，
+     包括测试；打包时你只想要运行时真正需要的文件。拆开之后，
+     `pnpm typecheck` 管全部，`pnpm build` 管产物，两边互不干扰。
+   </Callout>
+
+2. `src/index.ts` 第一行有 shebang，这是成为 CLI 的前提：
+
+```ts title="examples/mini-claude-code/src/index.ts"
+#!/usr/bin/env node
+```
+
+   但 `tsc` 不会给产物加可执行权限。真正发布前还得补一步：
+
+```json title="examples/mini-claude-code/package.json"
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "postbuild": "chmod +x dist/index.js"
+  },
+```
+
+   <Callout type="warn" title="chmod 在 Windows 上会失败">
+     `postbuild` 里的 `chmod +x` 是 POSIX 专有的。真要跨平台发布，
+     得换成 `cross-env` 加一个 Node 脚本，或者干脆在包里放一个
+     `.cmd` 包装器。这是「玩具项目」和「能发布的产品」之间
+     真实存在的距离。
+   </Callout>
+
+顺带说一个容易踩的坑：源码里所有 import 都写成 `./agent.js` 这种带扩展名的形式，
+配合 `tsconfig.json` 里的 `"module": "NodeNext"` 和 `"verbatimModuleSyntax": true`，
+扩展名会被原样保留到产物里。`package.json` 里的 `"type": "module"` 让 `dist/*.js` 直接是 ESM，
+所以产物不需要任何额外的运行时分发步骤，`node dist/index.js` 就能跑。
+
+最后是发包。`package.json` 现在是 `"private": true`，npm 会拒绝发布；发布前要去掉它，
+加上 `"files": ["dist"]`，免得把源码和测试一起塞进包里。
+
+## Node 版本要求
+
+`package.json` 里还没有 `engines` 字段。发布时应该加上：
+
+```json title="examples/mini-claude-code/package.json"
+  "engines": {
+    "node": ">=20"
+  }
+```
+
+Node 20 不是随便挑的：测试要用 `node --import tsx --test`，`--import` 这个 flag 是
+Node 20.6 才加上的；源码用的是原生 ESM 加顶层 `await`，也需要现代 Node。
+在 `engines` 里写清楚，比让用户拿到一个 `SyntaxError` 强。
+
+## API key 怎么拿
+
+现在缺 key 就直接抛异常：
+
+```ts title="examples/mini-claude-code/src/llm.ts"
+export function createClient(): Anthropic {
+  const provider = getProvider();
+  if (provider === 'mimo') {
+    const apiKey = process.env.MIMO_API_KEY;
+    if (!apiKey) throw new Error('缺少 MIMO_API_KEY。请设置 MiMo Token Plan 订阅密钥（tp-...）。');
+    return createOpenAIClient({ apiKey, baseURL: process.env.MIMO_BASE_URL ?? 'https://token-plan-cn.xiaomimimo.com/v1' });
+  }
+  // ...
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      '缺少 ANTHROPIC_API_KEY 环境变量。\n' +
+        '请先执行：export ANTHROPIC_API_KEY=sk-ant-xxx',
+    );
+  }
+  return new Anthropic({ apiKey });
+}
+```
+
+自己用没问题，发布给别人用就有问题了：要求每个用户都懂 `export` 是什么、
+知道 key 要放在环境变量里，还不能把 key 写进项目目录被提交上去。
+
+比较友好的做法是两条路都留：
+
+1. 先看环境变量（CI、脚本、老用户不受影响）；
+2. 没有就交互式提示输入，存到用户配置目录（比如 `~/.config/mini-claude-code/config.json`），
+   文件权限设成 `0600`。
+
+关键是**要说清楚 key 存在哪**。很多工具在这件事上含糊其辞，用户根本不知道自己的
+密钥被写到了什么地方。
+
+<Callout type="idea" title="支持多家服务商，key 的引导就变复杂了">
+  只有一家的时候，「缺 key 就报错」是清楚的。变成三家之后，用户会面对
+  「我到底该设哪个变量」——而选错了报出来的错还各不相同。
+
+  好在这三家用的是同一套消息协议，适配层已经抹平了协议差异，所以
+  **key 的差异是唯一需要用户理解的东西**。发布时值得在 README 里
+  给一张三行的对照表：provider、变量名、默认模型。
+</Callout>
+
+模型名也一样，已经支持用环境变量覆盖：
+
+```ts title="examples/mini-claude-code/src/index.ts"
+const model = getModel();
+const client = createClient();
+```
+
+发布时把 provider、key 和模型这几个变量写进 README 的「配置」一节，比藏在代码里强。
+
+## 错误处理与崩溃恢复
+
+分两类看。
+
+**工具执行失败**：这是可恢复的，应该变成一条 `isError` 的 tool_result，让模型自己纠正。
+`#runTool` 里的 try/catch 已经做到了这一点：
+
+```ts title="examples/mini-claude-code/src/agent.ts"
+    } catch (error) {
+      const result: ToolResult = {
+        content: `工具执行抛出异常：${(error as Error).message}`,
+        isError: true,
+      };
+      this.#options.onToolEnd?.(name, result);
+      return this.#toToolResult(toolUse.id, result);
+    }
+```
+
+**循环失控**：轮数用完会抛出一个明确的错误：
+
+```ts title="examples/mini-claude-code/src/agent.ts"
+    throw new Error(`已达到最大轮数限制（${maxTurns}），强制结束。`);
+```
+
+REPL 层接住它，不让整个进程退出：
+
+```ts title="examples/mini-claude-code/src/index.ts"
+    ui.add('user', input);
+    ui.setBusy(true);
+    cancelled = false;
+    void agent.run(input).catch((error: Error) => ui.add(cancelled ? 'system' : 'error', cancelled ? '请求已取消。已完成的工具操作不会撤销。' : error.message))
+      .finally(() => ui.setBusy(false));
+```
+
+这个分层是对的：单次任务失败 → 提示一句，用户还能接着聊；进程级错误（比如配置文件损坏）
+→ 退出，让用户看到堆栈。
+
+注意 `cancelled` 这个标志：用户按 Ctrl+C 触发的取消，不该显示成红色错误——
+它是一个正常操作，不是一次失败。区分「用户主动取消」和「真的出错了」，
+是交互层最容易被忽略但用户最能感知的细节。
+
+`Ctrl+C` 走的是另一条路：`Agent` 有一个 `AbortController`，取消信号透传到子进程：
+
+```ts title="examples/mini-claude-code/src/agent.ts"
+  /** 取消当前正在进行的回合 */
+  abort(): void {
+    this.#controller.abort();
+  }
+```
+
+```ts title="examples/mini-claude-code/src/tools/bash-tool.ts"
+      const child = spawn('bash', ['-lc', input.command], {
+        cwd: workdir,
+        signal: ctx.signal,
+        env: { ...process.env, GIT_PAGER: 'cat', PAGER: 'cat' },
+      });
+```
+
+发布时要把这个接线补上——监听 `SIGINT`，调用 `agent.abort()`，
+而不是让 Node 默认地把进程直接杀掉（那样可能留下半个写完的文件）。
+
+## 可观测性
+
+三样东西：**日志、token 用量、每轮耗时**。
+
+日志不要打到 stdout——stdout 是 REPL 的地盘，混进去会把界面搞乱。写到文件里，
+一行一条 JSON，方便事后 `grep`。至少记：时间戳、工具名、入参、耗时、是否报错。
+
+token 用量可以直接复用现成的估算函数：
+
+```ts title="examples/mini-claude-code/src/llm.ts"
+/** 估算一组消息的 token 数 */
+export function estimateMessagesTokens(
+  messages: unknown[],
+  system?: string,
+): number {
+  const serialized = JSON.stringify(messages);
+  return estimateTokens(serialized) + (system ? estimateTokens(system) : 0);
+}
+```
+
+上下文管理器已经在用它了，而且压缩时会打印前后对比：
+
+```ts title="examples/mini-claude-code/src/agent.ts"
+    this.#options.onToolStart?.(
+      '__log__',
+      `${paintIf('gray', `[上下文压缩] ${before} → ${after} tokens`)}`,
+    );
+```
+
+把这个思路推广到每一轮：在 `#callModel` 前后打点，记录本轮请求前后的估算 token 和耗时。
+这些数字是用户唯一能看到的「这次任务花了多少钱」的近似值。
+
+每轮耗时尤其值得记：模型延迟、工具执行、网络往返，三者的比例决定了用户觉得「慢」还是「卡」。
+
+## 成本控制
+
+agent 循环最容易在你不注意时多跑几轮。三道闸：
+
+**轮数上限。** 默认值在这儿：
+
+```ts title="examples/mini-claude-code/src/agent.ts"
+    const maxTurns = this.#options.maxTurns ?? 50;
+```
+
+50 轮对复杂任务不算多，但作为**默认值**偏激进。发布时更稳妥的做法是：
+默认给一个保守值（比如 30），同时做成命令行参数或环境变量，让知道自己在干什么的人可以调高。
+另外别忘了子代理是成本放大器，见 [子代理](/docs/advanced/subagents)。
+
+**单次输出上限。** 每次模型请求的输出是限死的：
+
+```ts title="examples/mini-claude-code/src/agent.ts"
+        max_tokens: 8_192,
+```
+
+**工具输出截断。** 这层最容易漏。一条 `grep` 命中两千行、一次构建输出几万行，
+塞进上下文就是几万 token。仓库里已经在做了：
+
+```ts title="examples/mini-claude-code/src/tools/bash-tool.ts"
+        if (stdout.trim()) parts.push(truncate(stdout, 20_000).trimEnd());
+        if (stderr.trim()) parts.push(`[stderr]\n${truncate(stderr, 10_000).trimEnd()}`);
+```
+
+`Read` 也有 `offset`/`limit` 让模型分段读。把这些截断阈值做成可配置项，
+是发布前值得花时间做的一件事。
+
+## 测试策略
+
+现有测试在 `examples/mini-claude-code/test/tools.test.ts`，用 Node 内置的测试运行器：
+
+```ts title="examples/mini-claude-code/test/tools.test.ts"
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { ToolRegistry } from '../src/tools/registry.js';
+import { BUILTIN_TOOLS } from '../src/tools/index.js';
+import type { ToolContext } from '../src/tools/types.js';
+import { FileReadTrackerImpl } from '../src/tools/fs-utils.js';
+
+/** 造一个临时的沙箱目录，跑完就删 */
+async function withSandbox<T>(fn: (cwd: string) => Promise<T>): Promise<T> {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mcc-test-'));
+  try {
+    return await fn(cwd);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+}
+
+function makeContext(cwd: string): ToolContext {
+  return {
+    cwd,
+    signal: AbortSignal.timeout(10_000),
+    confirm: async () => true,
+    write: () => {},
+    todos: [],
+    fileReads: new FileReadTrackerImpl(),
+  };
+}
+```
+
+共 18 个用例，覆盖了注册表生成的 JSON Schema、Read 读文件与越界拒绝、Edit 的唯一性校验、
+Write 建目录、Glob、Grep、Bash 的成功与失败、TodoWrite 的状态约束，以及这轮重构
+带来的几条新行为：只读命令也要确认、符号链接不能绕过沙箱、压缩不能拆散
+`tool_use` 与 `tool_result`、同一轮工具按顺序执行、请求失败后丢弃不完整的历史、
+以及 OpenAI 兼容通道的工具调用与流中断处理。跑法：
+
+```bash
+node --import tsx --test test/tools.test.ts
+```
+
+`package.json` 里已经配好了脚本：
+
+```json title="examples/mini-claude-code/package.json"
+    "test": "node --import tsx --test test/tools.test.ts",
+```
+
+`node --import tsx` 是这里的关键：先用 tsx 把 TypeScript 变成 Node 能直接执行的 JS，
+再交给 Node 内置的测试运行器（`node:test`）。整个项目因此不需要额外的测试框架依赖——
+少一个依赖，就少一份版本冲突的可能。
+
+**为什么工具好测。** 工具的接口是 `execute(input, ctx) -> ToolResult`：输入确定、
+上下文可注入、没有隐式全局状态。断言直接落在返回值上，跑一次几毫秒，
+不需要网络也不需要 API key。`withSandbox` 造临时目录、`makeContext` 造假上下文，
+两个辅助函数把「环境」完全控制住了。
+
+**为什么 agent 循环难测。** 它要发真实请求、要花真实钱、带真实副作用，
+而且循环里嵌套着模型决策、工具执行、上下文压缩三条线。直接测等于测 Anthropic 的服务。
+
+所以要把循环拆成**可注入依赖**。`Agent` 的构造函数其实已经做对了一半：
+
+```ts title="examples/mini-claude-code/src/agent.ts"
+export interface AgentOptions {
+  client: Anthropic;
+  tools: ToolRegistry;
+  permissions?: PermissionManager;
+  contextManager?: ContextManager;
+  systemPrompt: string;
+  model: string;
+  cwd: string;
+  maxTurns?: number;
+  // ...
+}
+```
+
+`client` 是注入进来的，所以测试时可以塞一个假的。假的客户端只要实现
+`messages.stream()`，返回一个带 `on` 和 `finalMessage()` 的对象就够了：
+
+```ts title="examples/mini-claude-code/test/agent.test.ts"
+// 本章新增：不联网地跑一遍 agent 循环
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import type Anthropic from '@anthropic-ai/sdk';
+import { Agent } from '../src/agent.js';
+import { BUILTIN_TOOLS, ToolRegistry } from '../src/tools/index.js';
+
+/** 造一个只会按剧本回答的假模型 */
+function fakeClient(replies: unknown[][]): Anthropic {
+  let index = 0;
+  return {
+    messages: {
+      stream: () => ({
+        on: () => {},
+        finalMessage: async () => {
+          const reply = replies[index++];
+          return { stop_reason: reply[0], content: reply[1] };
+        },
+      }),
+    },
+  } as unknown as Anthropic;
+}
+
+test('agent 会把工具结果回喂给模型', async () => {
+  const client = fakeClient([
+    ['tool_use', [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.txt' } }]],
+    ['end_turn', [{ type: 'text', text: '读完了' }]],
+  ]);
+
+  const agent = new Agent({
+    client,
+    tools: new ToolRegistry().registerAll(BUILTIN_TOOLS),
+    systemPrompt: 'test',
+    model: 'test-model',
+    cwd: process.cwd(),
+  });
+
+  await agent.run('读一下 a.txt');
+
+  assert.equal(agent.messages.length, 3);
+  assert.equal(agent.messages[2].role, 'user');
+});
+```
+
+有了这个假模型，循环就能离线断言：消息条数、顺序、工具结果有没有被回喂、
+上下文压缩有没有被触发、超轮数有没有抛错——全都不用花一分钱。
+
+<Callout type="warn" title="工作目录不是真空">
+  用户会把 agent 指向任意目录。别把「工作目录」当成沙箱之外的安全区——
+  所有路径操作都必须先过 `isInside()`：
+
+  ```ts title="examples/mini-claude-code/src/tools/fs-utils.ts"
+  export function isInside(root: string, target: string): boolean {
+    const relative = path.relative(path.resolve(root), path.resolve(target));
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  }
+  ```
+
+  内置的 `Read`/`Write`/`Edit`/`Bash` 都做了这道检查，但你自己加的工具、
+  自己写的钩子、还有 MCP 工具——一旦接了外部输入，就必须自己再过一次。
+  `isInside` 本身拦不住符号链接；文件与搜索工具额外检查已有路径组件并拒绝符号链接。这仍有检查与使用之间的竞态，Bash 也不受目录限制，生产环境应使用操作系统级隔离。
+</Callout>
+
+## 小结
+
+- `bin` 字段和 `tsconfig.build.json` 已经就位，`pnpm build` 能直接产出 `dist/`；发布前还要补 `chmod +x`、`engines.node: ">=20"`、去掉 `private: true`、加上 `files`。
+- key 要么读环境变量，要么交互式问用户并说清楚存在哪；模型名同样支持环境变量覆盖。
+- 错误分两类：工具失败转成 `isError` 给模型纠正，循环失控抛给 REPL 层处理。
+- 可观测性三件套：日志文件、token 估算、每轮耗时——现成的 `estimateMessagesTokens` 就能用。
+- 成本三道闸：`maxTurns`、`max_tokens`、工具输出截断。
+- 工具好测是因为 `execute(input, ctx)` 是纯的；循环难测，所以要把 `client` 做成可注入依赖。
+- 最后：[端到端实战](/docs/practice/capstone) 把这些串起来跑一遍真实任务。

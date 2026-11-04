@@ -1,0 +1,280 @@
+---
+title: 端到端实战
+description: 用一个真实的多步改造任务，走完探索、计划、修改、验证的完整 agent 工作流。
+---
+
+本章把前面所有章节拼起来，用 Mini Claude Code 真的改一次代码。
+你会看到 agent 在每一步用了什么工具、对应哪一章，以及它在哪里会翻车。
+
+## 任务
+
+拿一个你有权限改的真实项目练手。这里假设你手头有个 Express 服务，鉴权目前只有 JWT，
+用户提了一个需求：
+
+> 「这个仓库里鉴权是怎么做的？把它改成支持 API Key。」
+
+这个任务选得挺好，因为它同时包含了探索、决策、编码、验证四类动作，
+而且每一步的产出都是下一步的输入。
+
+<Callout type="info" title="练手建议">
+  拿一个你熟悉的、规模不大（几十个文件）的项目。规模太大的项目会让 agent 在
+  探索阶段就烧掉大半预算，而你还没来得及看到它真正改代码的那一步。
+</Callout>
+
+## 完整流程
+
+<Steps>
+  <Step title="摸清现状：Glob 和 Grep">
+
+  第一步是定位，不是猜测。系统提示词里已经写死了这条规矩：
+
+  ```ts title="examples/mini-claude-code/src/prompt.ts"
+  工具使用原则：
+  - 优先用 Glob / Grep 定位，不要凭记忆猜文件路径。
+  ```
+
+  模型先列目录，再按关键字搜：
+
+  ```
+  ● Glob
+    ✓ Glob
+  ● Grep
+    ✓ Grep
+  ```
+
+  典型的产出是三个候选位置：`src/auth/middleware.ts`、`src/routes/users.ts`、`src/app.ts`。
+
+  这里全用只读工具是有讲究的。`src/permissions.ts` 的默认规则里，
+  `Read`、`Glob`、`Grep` 都是 `allow`：
+
+  ```ts title="examples/mini-claude-code/src/permissions.ts"
+    { tool: 'Read', decision: 'allow', reason: '只读操作' },
+    { tool: 'Glob', decision: 'allow', reason: '只读操作' },
+    { tool: 'Grep', decision: 'allow', reason: '只读操作' },
+  ```
+
+  不会弹确认框，agent 能连续跑下去。换成 `Bash` 就要问用户了——
+  探索阶段用 `ls`/`grep` 这种「用工具换 shell」的做法，是纯亏。
+
+  对应 [搜索工具](/docs/tools/search-tools)。
+
+  </Step>
+  <Step title="列计划：TodoWrite">
+
+  知道要改哪儿了，先把步骤写下来：
+
+  ```
+  ● TodoWrite
+    ✓ TodoWrite
+  ```
+
+  ```
+  [>] 读取 src/auth/middleware.ts
+  [ ] 新建 src/auth/api-key.ts
+  [ ] 改造 middleware 支持两种鉴权
+  [ ] 补充环境变量文档
+  [ ] 跑测试
+  ```
+
+  TodoWrite 每次传入的是**完整清单**，不是增量。而且同一时刻只能有一个 `in_progress`：
+
+  ```ts title="examples/mini-claude-code/src/tools/bash-tool.ts"
+      const inProgress = input.todos.filter((todo) => todo.status === 'in_progress');
+
+      if (inProgress.length > 1) {
+        return {
+          content: `有 ${inProgress.length} 个任务同时处于 in_progress，请只保留一个。`,
+          isError: true,
+        };
+      }
+  ```
+
+  这不是形式主义。清单会占用一点上下文，但它换来两样东西：
+  你能实时看到进度，模型自己也不容易漏步骤。任务超过三步就该用它。
+
+  对应 [任务清单](/docs/tools/todo-tools)。
+
+  </Step>
+  <Step title="读代码：Read，以及一个容易被忽略的副作用">
+
+  ```
+  ● Read src/auth/middleware.ts
+    ✓ Read
+  ```
+
+  这次读取不只是为了「看内容」。`src/tools/fs-tools.ts` 在读完时会记一个指纹：
+
+  ```ts title="examples/mini-claude-code/src/tools/fs-tools.ts"
+      // 记录指纹，供 Edit 工具做「读后再改」检查
+      ctx.fileReads.markRead(filePath, await fingerprint(content));
+  ```
+
+  这个指纹是下一步能不能改的前提。没有它，`Edit` 会认为你没读过这个文件。
+  换句话说，「先 Read 再 Edit」不是流程建议，是工具链的硬约束。
+
+  文件大的时候用 `offset`/`limit` 分段读，比一次性读进来更省上下文。
+
+  对应 [文件工具](/docs/tools/file-tools)。
+
+  </Step>
+  <Step title="改代码：Edit 和 Write，以及两道确认">
+
+  改已有文件用 `Edit` 做精确替换，新建文件才用 `Write`：
+
+  ```
+  ● Edit src/auth/middleware.ts
+    ✓ Edit
+  ● Write src/auth/api-key.ts
+    ✓ Write
+  ```
+
+  这两步都会触发用户确认，因为默认规则里它们是 `ask`：
+
+  ```ts title="examples/mini-claude-code/src/permissions.ts"
+    { tool: 'Write', decision: 'ask', reason: '将写入或覆盖文件' },
+    { tool: 'Edit', decision: 'ask', reason: '将修改文件内容' },
+  ```
+
+  你会看到终端弹出：
+
+  ```
+  ⚠ 允许执行 Edit？
+  将修改文件内容
+  src/auth/middleware.ts
+  允许执行？[y/N]
+  ```
+
+  拒绝也没关系，agent 会收到一条 `isError` 的结果：
+
+  ```ts title="examples/mini-claude-code/src/agent.ts"
+          content: `用户拒绝了 ${name} 操作。请不要重试同一个操作，先说明你想做什么。`,
+  ```
+
+  注意那句「不要重试同一个操作」——这是专门写进提示的，
+  防止模型被拒之后换个姿势再试一遍，把你烦死。
+
+  还有一件事：`Edit` 会检查文件在你读完之后有没有被别人改过：
+
+  ```ts title="examples/mini-claude-code/src/tools/fs-tools.ts"
+      // 读-改-写一致性检查：模型可能基于过期的文件内容做修改
+      if (ctx.fileReads.wasRead(filePath)) {
+        const current = await fingerprint(original);
+        if (ctx.fileReads.hasChanged(filePath, current)) {
+  ```
+
+  被人改过就让它重读一遍。这不是多余的严格——基于过期内容改代码，是最难查的一类 bug。
+
+  对应 [文件工具](/docs/tools/file-tools) 和 [权限模型](/docs/engineering/permissions)。
+
+  </Step>
+  <Step title="验证：跑测试">
+
+  ```
+  ● Bash
+    ✓ Bash
+  ```
+
+  命令在 `ctx.cwd` 下执行，输出被截断，退出码非零就标 `isError`：
+
+  ```ts title="examples/mini-claude-code/src/tools/bash-tool.ts"
+        parts.push(`[exit code: ${code ?? 'null'}]`);
+
+        resolve({
+          content: parts.join('\n\n'),
+          isError: code !== 0,
+        });
+  ```
+
+  测试挂了就重来一轮，读错误信息，改代码，再跑。这个「看报错 → 改 → 再跑」的循环
+  是 agent 相对人工最大的优势所在。
+
+  危险命令会被权限模型直接拦掉，`rm -rf /` 这种根本到不了 `spawn`：
+
+  ```ts title="examples/mini-claude-code/src/permissions.ts"
+    {
+      tool: 'Bash',
+      pattern: 'rm\\s+(-[a-zA-Z]*[rf][a-zA-Z]*\\s+)*(/|~|\\*)',
+      decision: 'deny',
+      reason: '该命令会递归删除根目录或家目录，属于不可逆的破坏性操作',
+    },
+  ```
+
+  对应 [命令执行](/docs/tools/bash-tools) 和 [权限模型](/docs/engineering/permissions)。
+
+  </Step>
+  <Step title="收尾：更新清单，给出总结">
+
+  最后把 TodoWrite 的清单全部标成 `completed`，然后用文字回答：
+
+  ```
+  ● TodoWrite
+    ✓ TodoWrite
+  ● 已经改好了。改动集中在三个文件：
+
+    1. src/auth/api-key.ts（新增）——校验 API Key 的逻辑
+    2. src/auth/middleware.ts —— 改成 JWT 和 API Key 双通道
+    3. README.md —— 补了配置说明
+
+    新增环境变量 API_KEYS，逗号分隔。
+  ```
+
+  注意这一轮没有工具调用，所以循环直接结束——`#runTool` 根本不会被触发。
+  这就是 [agent 循环](/docs/core/agent-loop) 的终止条件。
+
+  </Step>
+</Steps>
+
+## 设计复盘：我们简化了什么
+
+上面这套流程能跑，但它离真实的 Claude Code 还有距离。下面这些是**我们没做**的，
+也是你继续做这个项目时会撞上的：
+
+- **权限弹窗 UI**：我们只有一个 `y/N` 文本确认。真实版本是一个 TUI 弹窗，
+  带 diff 预览和多选项（允许一次、允许本次会话、拒绝）。
+- **diff 预览**：真实版本在 `Edit` 前展示改动内容让你逐行确认。我们直接就改了。
+- **并行与后台任务**：同一轮工具调用目前串行执行，也没有后台任务或子代理并行。
+- **MCP**：还没接外部工具服务，见 [MCP 接入](/docs/advanced/mcp)。
+- **钩子**：还没有「写文件前自动 lint」这类机制，见 [钩子](/docs/advanced/hooks)。
+- **子代理**：主上下文还是会随着探索阶段膨胀，见 [子代理](/docs/advanced/subagents)。
+- **prompt caching**：我们每次请求都把系统提示词和全部历史重新发一遍，
+  没做缓存。任务越长，重复付费的部分越多。
+- **上下文压缩的质量**：`ContextManager` 的摘要是模型自己写的，
+  丢细节是必然的。真实版本会区分「要压缩的对话」和「不能压缩的代码」。
+
+<Callout type="warn" title="agent 最常见的失败模式">
+  三个高频翻车点，按出现频率排：
+
+  1. **工具顺序错了**——先 `Edit` 后 `Read`，被「读后写校验」拦下来。
+     规则很简单：任何写操作之前，先读同一个文件。
+  2. **基于过期内容改代码**——你在 agent 读完之后手动改了同一个文件，
+     agent 的 `Edit` 会被指纹检查拦下并要求重读；但如果没读过就改，
+     它会直接覆盖你的修改，丢掉你的工作。
+  3. **上下文被无效输出占满**——一次 `Grep` 命中两千行、一次构建输出几万行。
+     这些内容会挤掉真正重要的对话历史，最后触发压缩，
+     而压缩后的摘要已经没有精确细节了，agent 开始瞎改。
+     对策是让 agent 用更精确的 `pattern`、用 `Read` 的 `offset`/`limit` 分段读，
+     而不是一次拉回整个仓库。
+</Callout>
+
+## 下一步
+
+这份实战里有三处明显的扩展点，正好对应进阶部分的三章：
+
+- **探索阶段换个子代理**——让子代理去搜「所有调用鉴权中间件的地方」，
+  主上下文只多一句结论：[子代理](/docs/advanced/subagents)
+- **接一个 issue tracker**——把「哪些地方需要改」从模型猜变成查出来：
+  [MCP 接入](/docs/advanced/mcp)
+- **加一道自动校验**——写完代码自动跑 lint，不通过就拦住：
+  [钩子](/docs/advanced/hooks)
+
+另外，想把它给别人用，看 [打包发布](/docs/advanced/production)。
+
+## 小结
+
+- 一个真实的多步任务会自然拆成：定位 → 计划 → 读 → 改 → 验证 → 总结，
+  每一步都有对应的工具和对应的章节。
+- 工具选型有规律：只读优先用 `Glob`/`Grep`/`Read`，写操作才用 `Edit`/`Write`/`Bash`，
+  前者不会打断你，后者会。
+- 顺序有硬约束：先读后写、读后改用 `Edit`、每轮只留一个 `in_progress` 任务。
+- 我们简化掉的东西（diff 预览、并行任务、MCP、钩子、子代理、prompt caching）
+  就是这个项目的下一站。

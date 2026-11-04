@@ -1,0 +1,166 @@
+---
+title: 架构总览
+description: 拆开 coding agent 的五层结构，说清它和 Claude Code 的差距。
+---
+
+本章你会拿到整份教程的地图：每一层由哪些文件构成、解决什么问题，以及后面每一章落在地图的哪个位置。
+
+## Claude Code 是什么
+
+Claude Code 是一个跑在终端里的编程助手。你用自然语言描述任务，它自己读代码、
+改代码、跑命令，然后告诉你改了什么。
+
+它真正替人干掉的，是五件很具体的事：
+
+1. **读代码** —— 模型本身看不见你的文件系统。没有工具，它只能靠训练时
+   记住的代码片段瞎猜。
+2. **改代码** —— 不是让它「输出 diff 给你贴」，而是给它一个能精确替换字符串
+   的编辑工具，并且强制它改之前先读。
+3. **跑命令** —— 构建、测试、git 操作，都得真的执行才有意义。
+4. **多步任务** —— 「找出所有 TODO 并逐个修掉」不是一个请求，是几十轮请求。
+5. **长上下文** —— 一个大任务的对话历史很容易撑爆模型的上下文窗口
+   （context window），需要一条压缩旧历史的通路。
+
+这五件事对应五组机制。理解了它们，你就能看懂任何 coding agent 的骨架——
+包括 Claude Code 自己。
+
+## 一个 coding agent 的最小零件
+
+把上面五条拆开，其实只需要五个零件：
+
+| 零件 | 干什么 | 在我们代码里 |
+| --- | --- | --- |
+| 模型调用 | 把消息发给模型，拿到回复 | `src/llm.ts` |
+| 工具定义 | 告诉模型「你能调用哪些工具、参数长什么样」 | `src/tools/types.ts` |
+| 工具执行 | 真的去读文件、跑命令，把结果变成文本 | `src/tools/*-tool.ts` |
+| 会话历史 | 记住这一轮对话说过什么，模型才知道上文 | `src/agent.ts` 的 `#messages` + `src/context.ts` |
+| 权限层 | 决定这次操作是放行、问你、还是拒绝 | `src/permissions.ts` |
+
+少了任何一个，agent 都不成立：没有工具定义，模型不知道自己能干什么；
+没有工具执行，工具定义只是摆设；没有会话历史，模型每一轮都在失忆；
+没有权限层，agent 能直接删掉你的家目录。
+
+<Callout type="idea" title="为什么先手写，再学框架">
+  Claude Agent SDK、LangChain、各家框架的 agent helper，都会替你把这些零件
+  装好——但也把关键决策藏了起来：循环怎么转、上下文满了压缩谁、两个工具
+  描述冲突了听谁的、权限判定失败是抛异常还是返回错误。
+
+  这些决策恰恰是一个 coding agent 最难的部分。先手写一遍，你再用
+  Claude Code 或任何框架时，就知道它为什么这么设计、它的取舍在哪里。
+  反过来，先用框架的人往往说不清「我的 agent 为什么把文件改坏了」。
+
+  代价当然有：手写版本没有生产级打磨。但作为教程，先跑通再打磨的顺序
+  是对的。
+</Callout>
+
+## 五层结构
+
+把零件按数据流排一下，整个系统长这样：
+
+```text
+交互层        src/index.ts · src/ui.ts
+              读用户输入、渲染输出、弹出权限确认
+   │
+   ▼
+agent 循环     src/agent.ts
+              模型 → 工具 → 结果 → 模型，直到模型不再要工具
+   │
+   ▼
+工具层        src/tools/registry.ts · src/tools/*-tool.ts
+              定义工具、校验入参、执行、返回文本结果
+   │
+   ▼
+权限层        src/permissions.ts
+              放行（allow）/ 询问（ask）/ 拒绝（deny）
+   │
+   ▼
+LLM 层        src/llm.ts
+              Anthropic Messages API
+```
+
+会话历史这一层没有单独画成竖条，因为它同时住在两个地方：`src/agent.ts` 里的
+`#messages` 数组是「原始历史」，`src/context.ts` 负责在它撑爆窗口之前把它压成摘要。
+它是循环的燃料，贴着循环长。
+
+从上到下读一遍：`src/index.ts` 收到你的一句话，交给 `Agent.run()`；
+`Agent` 把消息发给模型；模型说「我要调 Read」；`agent.ts` 先问
+`permissions.ts` 这事让不干，再让 `tools/` 真的去读；读到的内容作为一条
+user 消息回填给模型；模型据此写出最终答案。
+
+## 我们和真正的 Claude Code 差在哪
+
+Mini Claude Code 是教学实现，不是产品。差异集中在这几处：
+
+| 能力 | 真正的 Claude Code | Mini Claude Code |
+| --- | --- | --- |
+| 外部工具 | 用 MCP（Model Context Protocol）接第三方工具服务 | 没有，只有内置的 7 个工具 |
+| 生命周期钩子 | Hooks，在工具执行前后插入自己的逻辑 | 没有 |
+| 子代理 | 把子任务丢进独立上下文，只收回摘要 | 没有 |
+| 终端界面 | 完整的 TUI（文本用户界面）渲染 | readline + ANSI 颜色，一行一问 |
+| 权限确认 | 交互式弹窗 UI | 终端里问一句 `允许执行？[y/N]` |
+| 权限规则来源 | 配置文件 + 会话内临时授权 | 硬编码在 `src/permissions.ts` |
+
+先说清楚我们**没有**什么，比说有什么更有用：没有 MCP，你的 agent 就只能用
+写死在代码里的工具；没有子代理，就没有「把探索型子任务隔离出去」这回事；
+没有 TUI，你就感受不到真实产品打磨过的交互细节——而这些细节恰恰是
+「为什么它比我用的顺手」的全部来源。
+
+我们要的只是最小可运行的那条主干：调用模型、执行工具、回填结果、卡住权限。
+剩下的差异，第 8 章之后会一项一项补上。
+
+## 接下来的路线
+
+<Steps>
+
+<Step title="先跑通最小闭环">
+
+[第一个 Agent](/docs/getting-started/first-agent) 用几十行代码调通一次
+Messages API，然后加上工具，看模型如何要求调用工具。
+
+</Step>
+
+<Step title="再拆循环">
+
+[Agent 循环](/docs/core/agent-loop) 是整个教程的心脏——请求模型、识别
+`tool_use`、执行工具、把 `tool_result` 喂回去。
+配套的还有 [流式响应](/docs/core/streaming) 和
+[工具调用协议](/docs/core/tool-protocol)。
+
+</Step>
+
+<Step title="然后是工具层">
+
+[Schema 与注册表](/docs/tools/schema) 讲一份 zod schema 怎么同时喂给模型
+和运行时校验；接着是 [文件工具](/docs/tools/file-tools)、
+[搜索工具](/docs/tools/search-tools)、[命令执行](/docs/tools/bash-tools)
+和 [任务清单](/docs/tools/todo-tools)。
+
+</Step>
+
+<Step title="再补工程化">
+
+[系统提示词](/docs/engineering/system-prompt)、
+[权限模型](/docs/engineering/permissions)、
+[上下文管理](/docs/engineering/context)、
+[项目记忆](/docs/engineering/memory)。这四件事决定 agent 好不好用，
+而不只是能不能跑。
+
+</Step>
+
+<Step title="最后是进阶">
+
+[子代理](/docs/advanced/subagents)、[MCP 接入](/docs/advanced/mcp)、
+[钩子](/docs/advanced/hooks)、[打包发布](/docs/advanced/production)，
+最后用 [端到端实战](/docs/practice/capstone) 把整条线串一遍。
+
+</Step>
+
+</Steps>
+
+## 小结
+
+- Claude Code 解决的是读代码、改代码、跑命令、多步任务、长上下文这五件事。
+- 一个 coding agent 最少需要：模型调用、工具定义、工具执行、会话历史、权限层。
+- 系统分五层：交互层 → agent 循环 → 工具层 → 权限层 → LLM 层。
+- 我们没有 MCP、钩子、子代理、TUI 和权限弹窗 UI——先主干，后补齐。
+- 先手写再学框架，因为框架会把最难的决策藏起来。

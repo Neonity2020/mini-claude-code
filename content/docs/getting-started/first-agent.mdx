@@ -1,0 +1,318 @@
+---
+title: 第一个 Agent
+description: 用几十行 TypeScript 调通一次模型调用，再看懂加上工具之后多出来的那个循环。
+---
+
+本章你会得到一个能打印模型回复的程序，然后看清「加上工具」到底多出了哪几行。
+
+## 先跑通一次模型调用
+
+先把工具忘掉。一个 coding agent 最开始也只是一次普通的 API 调用：
+你给一句话，它还一句话。
+
+在示例项目里新建 `src/hello.ts`：
+
+```ts title="src/hello.ts"
+import Anthropic from '@anthropic-ai/sdk';
+
+async function main(): Promise<void> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      '缺少 ANTHROPIC_API_KEY 环境变量。\n' +
+        '请先执行：export ANTHROPIC_API_KEY=sk-ant-xxx',
+    );
+  }
+
+  const client = new Anthropic({ apiKey });
+
+  // 默认模型与 src/llm.ts 的 DEFAULT_MODEL 一致
+  const model = process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-6';
+
+  const response = await client.messages.create({
+    model,
+    max_tokens: 1_000,
+    system: '你是一个运行在终端里的编程助手，名字叫 Mini Claude Code。',
+    messages: [{ role: 'user', content: '用一句话介绍你自己。' }],
+  });
+
+  for (const block of response.content) {
+    if (block.type === 'text') console.log(block.text);
+  }
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+```
+
+跑起来：
+
+```bash
+node --import tsx src/hello.ts
+```
+
+<Callout type="warn" title="max_tokens 到底是什么">
+  `max_tokens` 是**模型单次回复的最大 token 数**，不是上下文窗口大小，也不是
+  整个会话的总额度。Anthropic 的 API 把它设成必填，不填直接报错。
+
+  超限有两种表现，别混淆：
+
+  - 模型想说的话太长，被硬生生截断——**不报错**，但响应的 `stop_reason`
+    变成 `"max_tokens"`，你拿到的是半句话。这是最容易漏掉的一种失败。
+  - 你填的 `max_tokens` 超过模型允许的上限——API 直接返回
+    `invalid_request_error`。
+
+  所以「模型说话说一半突然没了」几乎总是 `max_tokens` 的问题，不是网络问题。
+  改大它不会让模型变聪明，只是更贵。
+</Callout>
+
+### 客户端和模型 id 该放在哪
+
+上面这版把三件事揉在了一个文件里：读环境变量、建客户端、选模型。真实项目里
+它们该分开——`src/llm.ts` 负责这件事：
+
+```ts title="src/llm.ts"
+export const DEFAULT_MODEL = 'claude-sonnet-4-6';
+
+export function getProvider(): 'mimo' | 'anthropic' | 'openai' {
+  const value = process.env.LLM_PROVIDER ?? 'mimo';
+  if (value !== 'mimo' && value !== 'anthropic' && value !== 'openai') throw new Error('LLM_PROVIDER 必须是 mimo、anthropic 或 openai。');
+  return value;
+}
+```
+
+模型 id 的选择跟着 provider 走，每家各有自己的默认值和环境变量：
+
+```ts title="src/llm.ts"
+export function getModel(): string {
+  const provider = getProvider();
+  return provider === 'mimo' ? (process.env.MIMO_MODEL ?? 'mimo-v2.6-flash').replace(/^mimo\//, '')
+    : provider === 'openai' ? (process.env.OPENAI_MODEL ?? 'gpt-4.1') : (process.env.ANTHROPIC_MODEL ?? DEFAULT_MODEL);
+}
+```
+
+于是入口处只剩两行：
+
+```ts title="src/index.ts"
+const model = getModel();
+const client = createClient();
+```
+
+`ANTHROPIC_MODEL` 是我们自己定的约定，不写死模型 id 的好处是：换模型、改用
+别的模型做对比实验，都不用动代码。
+
+<Callout type="idea" title="为什么这里就能换服务商">
+  注意 `createClient()` 的返回类型始终是 `Anthropic`——换 provider 换掉的只是
+  底层实现，上层代码一行都不用改。这件事没看上去那么轻松，因为两家的
+  消息协议并不一样（工具结果怎么放、系统提示词在哪、结束标志叫什么）。
+  具体怎么做到的，见[多模型接入](/docs/core/providers)。
+</Callout>
+
+<Callout type="idea" title="这里用 create，真实项目用 stream">
+  最小程序用的是 `client.messages.create()`——一次请求拿完整回复，最省事。
+  但 `src/agent.ts` 里用的是 `client.messages.stream()`：流式接收，让回复
+  逐字出现，而不是你盯着一个光标等五秒。
+
+  两者返回的是同一种 `Message`，只是到达方式不同。流式还多解决了一个问题：
+  工具入参是分片到达的 JSON，`stream.finalMessage()` 帮你把碎片拼完整。
+  细节在 [流式响应](/docs/core/streaming)。
+</Callout>
+
+## 加上工具之后，多出了什么
+
+现在给模型一个工具：让它能读文件。请求侧只多一个 `tools` 字段。
+
+工具定义由注册表生成——把每个工具的 zod schema 转成标准 JSON Schema：
+
+```ts title="src/tools/registry.ts"
+  /** 转换成 Anthropic API 期望的工具列表 */
+  toAnthropicTools(): AnthropicTool[] {
+    return this.list().map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: z.toJSONSchema(tool.schema, {
+        io: 'input',
+        // 额外字段一律拒绝，避免模型幻觉出没定义的参数
+        override: (ctx) => {
+          const schema = ctx.jsonSchema as Record<string, unknown>;
+          if (schema.type === 'object') {
+            schema.additionalProperties = false;
+          }
+        },
+      }) as unknown as AnthropicTool['input_schema'],
+    }));
+  }
+```
+
+然后模型**可能**回你一个 `tool_use` 内容块。两种内容的区别是：
+
+| 内容块 | 谁产生 | 长什么样 |
+| --- | --- | --- |
+| `text` | 模型 | 一段文字 |
+| `tool_use` | 模型 | 工具名 + 工具入参（一个 JSON 对象）+ 一个 `id` |
+
+模型说完「我先看看这个文件」，`stop_reason` 会变成 `"tool_use"`。这时候你
+**必须**去真的执行那个工具，然后把结果回传——模型是看不到你的文件系统的。
+
+执行完的结果包成 `tool_result` 块，填上刚才那个 `id`：
+
+```ts title="src/agent.ts"
+  #toToolResult(
+    toolUseId: string,
+    result: ToolResult,
+  ): ToolResultBlockParam {
+    return {
+      type: 'tool_result',
+      tool_use_id: toolUseId,
+      content: result.content,
+      is_error: result.isError,
+    };
+  }
+```
+
+`tool_result` 必须以 **user 消息**的角色发回去。这是 Anthropic API 的协议
+要求，不是我们的约定。
+
+## 于是就有了循环
+
+把上面三件事串起来，就是整个 agent 的核心：
+
+```ts title="src/agent.ts"
+  /**
+   * 处理一轮用户输入。
+   *
+   * 核心就是一个 while 循环：
+   * 请求模型 → 如果模型要求调用工具，执行工具 → 把结果喂回去 → 再请求
+   * 直到模型不再要求调用工具。
+   */
+  async run(userInput: string): Promise<void> {
+    this.#controller = new AbortController();
+    const checkpoint = this.#messages.slice();
+    this.#messages.push({ role: 'user', content: userInput });
+    try {
+
+    const maxTurns = this.#options.maxTurns ?? 50;
+
+    for (let turn = 0; turn < maxTurns; turn++) {
+      await this.#maybeCompact();
+
+      const assistantMessage = await this.#callModel();
+      const reasoning = (assistantMessage as typeof assistantMessage & { reasoning_content?: string }).reasoning_content;
+      this.#messages.push({ role: 'assistant', content: assistantMessage.content, ...(reasoning !== undefined ? { reasoning_content: reasoning } : {}) });
+
+      const toolUses = assistantMessage.content.filter(
+        (block): block is ToolUseBlock => block.type === 'tool_use',
+      );
+
+      // 没有工具调用 -> 这一轮结束
+      if (assistantMessage.stop_reason !== 'tool_use' || toolUses.length === 0) {
+        return;
+      }
+
+      // 串行执行，避免写入竞争和确认提示交错。
+      const results: ToolResultBlockParam[] = [];
+      for (const toolUse of toolUses) results.push(await this.#runTool(toolUse));
+
+      // 工具结果必须作为 user 消息回传，这是 Anthropic API 的协议要求
+      this.#messages.push({ role: 'user', content: results });
+    }
+
+    throw new Error(`已达到最大轮数限制（${maxTurns}），强制结束。`);
+    } catch (error) {
+      // Discard incomplete tool exchanges so the next request has valid history.
+      this.#messages.splice(0, this.#messages.length, ...checkpoint);
+      throw error;
+    }
+  }
+```
+
+对着这段代码数一数，加了工具之后多出来的只有三件事：
+
+1. **请求里带上 `tools`** —— 让模型知道自己能调什么。
+2. **检查 `stop_reason` 是不是 `"tool_use"`** —— 决定这一轮是继续还是结束。
+3. **把 `tool_result` 作为 user 消息回填** —— 让模型看到执行结果。
+
+循环本身是个朴素的 `for`。难的从来不是循环，是循环里那些「什么时候该停」
+的判断。
+
+另外两行是后来补上的补丁：`#controller` 每轮重置（取消信号是一次性的，
+用一次就永久 aborted），`checkpoint` 用来在出错时回滚历史（一次失败的工具
+往返会在历史里留下残缺的协议，下一次请求会被 API 直接拒掉）。细节见
+[Agent 循环](/docs/core/agent-loop)。
+
+调用模型那段，工具是这么传进去的：
+
+```ts title="src/agent.ts"
+  /** 调用模型，流式接收 */
+  async #callModel() {
+    const stream = this.#options.client.messages.stream(
+      {
+        model: this.#options.model,
+        max_tokens: 8_192,
+        system: this.#options.systemPrompt,
+        messages: this.#messages,
+        tools: this.#options.tools.toAnthropicTools(),
+      },
+      { signal: this.#controller.signal },
+    );
+
+    stream.on('text', (delta) => {
+      this.#options.onText?.(delta);
+    });
+
+    // finalMessage() 会把流式片段拼装成一条完整的 Message，
+    // 包括工具入参的分片 JSON
+    return await stream.finalMessage();
+  }
+```
+
+<Callout type="info" title="到这儿你已经写完核心了">
+  你可能觉得有点意外：一个 coding agent 的核心就这么点东西。剩下的工作——
+  权限判定、参数校验、上下文压缩、工具的具体实现——都是在这个循环外面
+  加护栏。[Agent 循环](/docs/core/agent-loop) 会把这一节拆得更细，
+  顺便处理流式拼接和错误重试。
+</Callout>
+
+## 验证
+
+**第一步**，确认最小程序真的能通。跑：
+
+```bash
+node --import tsx src/hello.ts
+```
+
+应该看到一句自我介绍。再临时加一行 `console.log(response.stop_reason)`，
+打印出来应该是 `"end_turn"`——意思是「模型自己说完了，没有要调工具」。
+
+**第二步**，确认工具循环真的在跑。启动完整的 agent：
+
+```bash
+pnpm start
+```
+
+然后问一个必须查文件才能回答的问题：
+
+```text
+› src/tools/registry.ts 里 toAnthropicTools 做了什么？
+```
+
+终端上应该依次出现工具调用和结果，模型最后给出总结。如果它张口就答、
+一次工具都不调，说明 `tools` 没传进去。
+
+**第三步**，故意试一次会失败的调用，让模型看到错误。问它读一个不存在的文件，
+它会收到一条 `is_error` 为真的工具结果，然后自己换个策略——这正是
+`isError` 字段存在的意义。
+
+## 小结
+
+- 最小程序就三步：建客户端、带 `model` / `max_tokens` / `system` / `messages`
+  发一次请求、打印 `text` 内容块。
+- `max_tokens` 是单次回复的上限；超了会被截断，`stop_reason` 变成
+  `"max_tokens"`，不报错但内容不全。
+- 默认模型 `claude-sonnet-4-6` 定义在 `src/llm.ts` 的 `DEFAULT_MODEL`，
+  用 `ANTHROPIC_MODEL` 覆盖，不用改代码。
+- 加上工具后只多三件事：请求带 `tools`、检查 `stop_reason === "tool_use"`、
+  把 `tool_result` 作为 user 消息回填。
+- 循环本身是朴素的 `for`；难的是循环外面的护栏——下一章开始拆它们。

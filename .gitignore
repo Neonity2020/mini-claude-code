@@ -1,0 +1,31 @@
+# deps
+/node_modules
+**/node_modules
+
+# generated content
+.source
+
+# test & build
+/coverage
+/.next/
+/out/
+/build
+/examples/mini-claude-code/dist
+*.tsbuildinfo
+
+# misc
+.DS_Store
+/examples/mini-claude-code/pelican-bicycle.html
+*.pem
+/.pnp
+.pnp.js
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# others
+.env
+.env.*
+!.env.example
+.vercel
+next-env.d.ts

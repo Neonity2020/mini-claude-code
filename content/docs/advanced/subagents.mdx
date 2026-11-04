@@ -1,0 +1,357 @@
+---
+title: 子代理
+description: 把子任务放进独立上下文运行，只把结论摘要回传主 agent，避免上下文爆炸。
+---
+
+本章你要新写一个模块：`src/subagents/runner.ts`——一个能在主 agent 里被调用的子代理。
+它有自己独立的上下文，只把一份摘要交回主 agent。
+
+## 问题：主上下文是共享的
+
+`src/agent.ts` 里整个会话只有一条消息数组：
+
+```ts title="src/agent.ts"
+  readonly #messages: MessageParam[] = [];
+```
+
+所有工具结果都往这条数组里追加。一次 `Read` 读进来 300 行源码，一次 `Grep` 命中 200 个文件，
+这些内容全都变成后续每一轮请求的输入。
+
+而上下文预算是硬的。`src/context.ts` 里的 `ContextManager` 用一个阈值来卡线：
+
+```ts title="src/context.ts"
+  get limit(): number {
+    return Math.floor(this.#options.maxTokens * this.#options.compactThreshold);
+  }
+```
+
+默认 `maxTokens: 200_000`、`compactThreshold: 0.7`，也就是 14 万 token 的水位线。超了就压缩。
+
+但压缩是**事后补救**，而且有损。`#maybeCompact` 会把早期消息换成一段摘要：
+
+```ts title="src/context.ts"
+  async compact(messages: MessageParam[], system?: string): Promise<MessageParam[]> {
+    const keep = this.#options.keepRecentMessages;
+    if (messages.length <= keep) return messages;
+
+    let boundary = messages.length - keep;
+    // tool_result 必须紧跟包含对应 tool_use 的 assistant 消息。
+    const first = messages[boundary];
+    if (first?.role === 'user' && Array.isArray(first.content) &&
+        first.content.some((block) => block.type === 'tool_result')) boundary--;
+    const older = messages.slice(0, boundary);
+    const recent = messages.slice(boundary);
+
+    const summary = await this.#summarize(older);
+
+    const compacted: MessageParam[] = [
+      {
+        role: 'user',
+        content: `[上下文摘要] 以下是本次会话早期内容的摘要，请以此为准继续工作：\n\n${summary}`,
+      },
+      ...recent,
+    ];
+
+    return compacted;
+  }
+```
+
+摘要里不会有精确的文件内容、不会有一行行代码、不会有报错堆栈。压缩之后模型还能「记得」做过什么，
+但已经不能凭记忆改代码了。
+
+而且压缩不是纯文本处理：切分点必须避开 `tool_use` 和 `tool_result` 的配对，切错了压完的历史就是非法的，
+下一次请求会被 API 直接拒掉（细节见 [上下文管理](/docs/engineering/context)）。压缩这条路本身就有这么多
+边界要照顾，这也说明「把中间结果挪出主上下文」比「指望压缩来救场」更彻底。
+
+真正的矛盾在于：**任务需要的信息量和上下文预算是同一个量级**。你让 agent 调研一个陌生仓库的
+鉴权实现，它得读十几个文件；这些文件全进主上下文，主上下文就满了；一满就得压缩，一压缩
+细节就丢了；细节丢了它就得重读，重读又灌满上下文。这是个正反馈的坑。
+
+## 方案：独立上下文，只回传摘要
+
+子代理（subagent）的思路是把这个「读」和「记」拆开：
+
+- 子任务在**自己的**上下文里跑，读多少文件都不影响主 agent。
+- 干完活只回传一份结论（几百字），主 agent 的上下文增长的是这份结论，不是完整转录。
+
+主 agent 看到的就只是这个：
+
+```
+● Task
+  ✓ Task
+● 鉴权在 src/auth/middleware.ts，用 jsonwebtoken 验签。改成 API Key 需要动 3 个文件。
+```
+
+而不是十几个文件的全文。
+
+一个子代理有三条独立于主 agent 的属性：
+
+1. **独立的 messages 数组**——从空开始，跑完丢弃。
+2. **独立的系统提示词**——子代理被告知「你只需要回答这一个问题，不要写代码」，
+   和主 agent 的 `SYSTEM_PROMPT` 是两份东西。
+3. **通常更小的工具集**——它不需要 `Write`/`Edit`，只需要 `Read`/`Glob`/`Grep`。
+   工具少 → 每轮请求的 token 少 → 更便宜。
+
+## 实现
+
+> 本章新增模块：`src/subagents/runner.ts`。教程仓库里目前还没有这个文件，
+> 下面是要新写的代码。
+
+```ts title="src/subagents/runner.ts"
+import type Anthropic from '@anthropic-ai/sdk';
+import type {
+  MessageParam,
+  ToolResultBlockParam,
+  ToolUseBlock,
+} from '@anthropic-ai/sdk/resources/messages/messages.js';
+import type { ToolRegistry } from '../tools/registry.js';
+import type { ToolContext } from '../tools/types.js';
+
+export interface SubagentOptions {
+  client: Anthropic;
+  /** 子代理能用的工具，通常比主 agent 少 */
+  tools: ToolRegistry;
+  /** 子代理自己的系统提示词，和主 agent 的不是同一份 */
+  systemPrompt: string;
+  model: string;
+  cwd: string;
+  maxTurns?: number;
+  /** 每次工具执行都拿一份全新的 ToolContext */
+  createContext: () => ToolContext;
+}
+
+export interface SubagentResult {
+  /** 回传给主 agent 的唯一东西 */
+  summary: string;
+  /** 子代理实际跑了几轮 */
+  turns: number;
+}
+
+/**
+ * 子代理执行器。
+ *
+ * 它和主 agent 的区别只有一条，也正是全部意义所在：
+ * messages 是一个全新的数组，里面的一切主 agent 一条都看不到。
+ */
+export class SubagentRunner {
+  readonly #options: SubagentOptions;
+
+  constructor(options: SubagentOptions) {
+    this.#options = options;
+  }
+
+  /** 跑一个子任务，只把摘要交回去 */
+  async run(task: string): Promise<SubagentResult> {
+    // 独立上下文：从这里开始的所有消息，都不进入主 agent 的上下文
+    const messages: MessageParam[] = [{ role: 'user', content: task }];
+    const maxTurns = this.#options.maxTurns ?? 20;
+
+    for (let turn = 0; turn < maxTurns; turn++) {
+      const response = await this.#options.client.messages.create({
+        model: this.#options.model,
+        max_tokens: 8_192,
+        system: this.#options.systemPrompt,
+        messages,
+        tools: this.#options.tools.toAnthropicTools(),
+      });
+
+      messages.push({ role: 'assistant', content: response.content });
+
+      const toolUses = response.content.filter(
+        (block): block is ToolUseBlock => block.type === 'tool_use',
+      );
+
+      // 没有工具调用 -> 子任务结束，模型输出的文字就是摘要
+      if (response.stop_reason !== 'tool_use' || toolUses.length === 0) {
+        const summary = response.content
+          .filter((block) => block.type === 'text')
+          .map((block) => block.text)
+          .join('\n')
+          .trim();
+        return { summary, turns: turn + 1 };
+      }
+
+      const results: ToolResultBlockParam[] = [];
+      for (const toolUse of toolUses) results.push(await this.#runTool(toolUse));
+      messages.push({ role: 'user', content: results });
+    }
+
+    throw new Error(`子代理达到最大轮数限制（${maxTurns}），强制结束。`);
+  }
+
+  async #runTool(toolUse: ToolUseBlock): Promise<ToolResultBlockParam> {
+    const tool = this.#options.tools.get(toolUse.name);
+    if (!tool) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: `未知工具：${toolUse.name}`,
+        is_error: true,
+      };
+    }
+
+    const parsed = tool.schema.safeParse(toolUse.input ?? {});
+    if (!parsed.success) {
+      return {
+        type: 'tool_result',
+        tool_use_id: toolUse.id,
+        content: '参数不合法。',
+        is_error: true,
+      };
+    }
+
+    // 每次调用都拿一份新的 ToolContext：
+    // 子代理不共享主 agent 的 todos / fileReads 状态
+    const result = await tool.execute(parsed.data, this.#options.createContext());
+
+    return {
+      type: 'tool_result',
+      tool_use_id: toolUse.id,
+      content: result.content,
+      is_error: result.isError,
+    };
+  }
+}
+```
+
+注意 `createContext` 是一个**工厂函数**而不是一个共享实例——子代理有自己独立的待办清单和文件读取记录，
+否则子代理读过的文件会让主 agent 的 `Edit` 跳过「读后写校验」。
+
+再把它包装成主 agent 能调用的工具：
+
+```ts title="src/subagents/task-tool.ts"
+import { z } from 'zod';
+import type { Tool } from '../tools/types.js';
+import type { SubagentRunner } from './runner.js';
+
+const schema = z.object({
+  task: z.string().describe('交给子代理的任务描述，必须自包含'),
+  context: z.string().optional().describe('需要传给子代理的背景信息，比如文件路径'),
+});
+
+/**
+ * Task 工具：把子任务丢进独立上下文，只把摘要拿回来。
+ */
+export function createTaskTool(runner: SubagentRunner): Tool<typeof schema> {
+  return {
+    name: 'Task',
+    description:
+      '把一个独立的子任务交给子代理在独立上下文里完成，只返回最终结论摘要。' +
+      '适合：搜索代码库、调研某个主题、批量收集信息。不适合需要连续决策的任务。',
+    schema,
+    permission: 'allow',
+    primaryParam: 'task',
+    async execute(input, ctx) {
+      // 子代理看不到主上下文，必要信息必须在这里显式传进去
+      const task = input.context
+        ? `${input.task}\n\n背景信息：\n${input.context}`
+        : input.task;
+
+      const result = await runner.run(task);
+      ctx.write(`[子代理] ${result.turns} 轮，返回 ${result.summary.length} 字符`);
+
+      // 回传的只有摘要，主上下文增长的就是这几行
+      return { content: result.summary };
+    },
+  };
+}
+```
+
+组装起来：
+
+```ts title="examples/mini-claude-code/src/subagents/index.ts"
+import type Anthropic from '@anthropic-ai/sdk';
+import { ToolRegistry } from '../tools/registry.js';
+import { readTool, globTool, grepTool } from '../tools/index.js';
+import type { Tool } from '../tools/types.js';
+import { FileReadTrackerImpl } from '../tools/fs-utils.js';
+import { SubagentRunner } from './runner.js';
+import { createTaskTool } from './task-tool.js';
+
+const SUBAGENT_PROMPT = `你是一个只读的研究员。
+你的任务是回答一个具体问题，不要写代码、不要修改文件。
+完成后用不超过 200 字给出结论，结论里带上具体的文件路径。`;
+
+/** 子代理通常只给只读工具 */
+const subagentTools = new ToolRegistry().registerAll([readTool, globTool, grepTool]);
+
+export function createSubagentTools(client: Anthropic, model: string, cwd: string): Tool[] {
+  const runner = new SubagentRunner({
+    client,
+    tools: subagentTools,
+    systemPrompt: SUBAGENT_PROMPT,
+    model,
+    cwd,
+    maxTurns: 20,
+    createContext: () => ({
+      cwd,
+      signal: new AbortController().signal,
+      confirm: async () => false,
+      write: () => {},
+      todos: [],
+      fileReads: new FileReadTrackerImpl(),
+    }),
+  });
+
+  return [createTaskTool(runner)];
+}
+```
+
+## 什么样的任务适合交给子代理
+
+三个特征，缺一不可：
+
+- **独立**：子任务不需要主上下文里的中间状态。它问的是「这个仓库的鉴权是怎么做的」，
+  而不是「刚才那个文件里第三行是什么意思」。
+- **可并行**：几个子任务之间没有依赖，各自的上下文互不干扰，理论上可以同时跑。
+- **结论简短**：产出能压进几百字。子代理回传的是它的最终回答，不是它的思考过程。
+
+「可并行」目前是**潜力**而不是现状：主 agent 把同一轮里的工具调用串行执行，
+
+```ts title="src/agent.ts"
+      // 串行执行，避免写入竞争和确认提示交错。
+      const results: ToolResultBlockParam[] = [];
+      for (const toolUse of toolUses) results.push(await this.#runTool(toolUse));
+```
+
+模型一轮里请求三个 `Task`，三个子代理就是依次跑完的，不是同时跑。真要并发，得让 `Task` 工具内部自己去调度；本章这份实现只把「隔离上下文」这一半做对了。
+
+典型例子：
+
+- 在陌生仓库里搜出所有调用了某个 API 的地方
+- 给一个函数补一组测试用例
+- 把一份几兆的日志总结成几条线索
+- 调研某个库在当前版本里的 API 用法
+
+反例（别交给子代理）：
+
+- 需要「刚刚读到的文件内容」——子代理没有，主 agent 也拿不到
+- 需要连续多步决策的活——每一步都要看上一步的结果
+- 产出本身就是一大坨代码——回传摘要等于什么都没回传
+
+## 代价
+
+子代理最大的问题是**它看不到主上下文**。主 agent 刚读到的文件、刚和用户确认过的约束、
+刚从报错里读出来的线索，子代理一概不知。所以任务描述必须自包含：
+
+```
+❌ "把刚才那个文件的鉴权逻辑改成 API Key"
+✅ "把 src/auth/middleware.ts 里的 JWT 鉴权改成支持 API Key。
+    项目用 express + jsonwebtoken，测试用 vitest，入口在 src/index.ts。"
+```
+
+写任务描述的这几行字，其实就是你在替子代理做上下文工程。
+
+<Callout type="warn" title="子代理不是免费的">
+  子代理的每一轮请求、每一次工具调用都是真金白银。多开三个子代理，成本就是三倍——
+  主 agent 的上下文确实小了，但账单没有一起变小。
+  而且子代理失败时你只会拿到一句「我不知道」，得再花一轮去排查。
+  所以：任务要真的独立、结论要真的短、并发数要真的有必要，否则别开。
+</Callout>
+
+## 小结
+
+- 子代理的价值不是「更快」，而是**让主上下文只增长结论、不增长过程**。
+- 它靠三件事实现：独立的 messages、独立的系统提示词、更小的工具集。
+- 代价是它对主上下文一无所知，任务描述必须自包含，成本也要乘以子代理的个数。
+- 下一章讲的 [MCP 接入](/docs/advanced/mcp) 是另一个方向：不是拆上下文，而是扩能力。

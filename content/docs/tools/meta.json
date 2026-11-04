@@ -1,0 +1,10 @@
+{
+  "title": "工具系统",
+  "pages": [
+    "schema",
+    "file-tools",
+    "search-tools",
+    "bash-tools",
+    "todo-tools"
+  ]
+}

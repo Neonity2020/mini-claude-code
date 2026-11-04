@@ -1,0 +1,229 @@
+---
+title: 任务清单
+description: TodoWrite 用一份覆盖式清单跟踪多步任务，让进度可见、让模型不漏步骤。
+---
+
+本章你会得到一个 TodoWrite 工具：模型每完成一步就更新一次清单，你能在终端里看到它走到哪了，它自己也不会漏掉步骤。
+
+## 它解决什么问题
+
+一个「给这个项目加上国际化支持」这种任务，拆开来可能是七八步：找出所有硬编码文案、抽出文案表、接入语言包、替换调用点、处理日期和数字格式、补测试、跑构建。
+
+模型脑子里装着这七八步，但它**不会主动告诉你**它打算做什么，也不会说清楚已经做到哪一步。中间一旦出错，你看到的只是一段沉默的等待。
+
+TodoWrite 就是来解决这件事的：模型每做一步就调一次工具，把计划写下来、把进度标上去。清单同时出现在两个地方：
+
+- **回传给模型**——工具结果里带着渲染好的清单，模型下一轮就能看到自己刚才标了什么。
+- **留在 agent 里**——`ctx.todos` 指向 agent 内部的那份清单，终端 UI 可以随时读它。
+
+副作用同样重要：把计划写出来，等于逼模型在动手之前把任务拆清楚。拆不清楚的活，通常做不清楚。
+
+## 入参契约
+
+```ts title="src/tools/bash-tool.ts"
+const todoSchema = z.object({
+  todos: z
+    .array(
+      z.object({
+        content: z.string().describe('任务描述，使用祈使句'),
+        status: z.enum(['pending', 'in_progress', 'completed']).describe('任务状态'),
+        activeForm: z.string().optional().describe('进行中的动词短语，例如「正在读取文件」'),
+      }),
+    )
+    .describe('完整的待办清单（覆盖式的，不是追加）'),
+});
+```
+
+清单里每一项（todo item）有三个字段（schema 本身的写法见[Schema 与注册表](/docs/tools/schema)）：
+
+<TypeTable
+  type={{
+    content: {
+      type: 'string',
+      description: '任务描述，使用祈使句（写「查找硬编码文案」，不要写「查找硬编码文案中」）',
+      required: true,
+    },
+    status: {
+      type: "'pending' | 'in_progress' | 'completed'",
+      description: '任务状态。pending 待办，in_progress 正在做，completed 已完成',
+      required: true,
+    },
+    activeForm: {
+      type: 'string',
+      description: '进行中的动词短语，例如「正在读取文件」。用于让进度描述更自然',
+    },
+  }}
+/>
+
+`content` 要求用祈使句（「查找硬编码文案」而不是「我应该去查找硬编码文案」），是因为它要同时出现在终端的清单里和模型的思维里。`activeForm` 是可选的补充：写「正在读取文件」比「读取文件」更适合在进度里显示。
+
+对应的数据结构定义在：
+
+```ts title="src/tools/types.ts"
+/** 待办事项，供 TodoWrite 工具读写 */
+export interface TodoItem {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  activeForm?: string;
+}
+```
+
+## 覆盖式更新
+
+工具描述里专门强调了这一点：
+
+```ts title="src/tools/bash-tool.ts"
+  description:
+    '创建或更新待办清单，用于跟踪多步骤任务的进度。' +
+    '每次调用传入完整清单，不是增量。同一时刻最多一个任务处于 in_progress。',
+```
+
+也就是说，模型每次调用都要把**整份清单**重新传一遍，而不是只传变化的那一项。
+
+```ts title="src/tools/bash-tool.ts"
+    ctx.todos.length = 0;
+    ctx.todos.push(...input.todos);
+```
+
+这两行是整个更新逻辑。先把数组清空，再把所有新项推进去——是整体替换，不是合并。
+
+**为什么不用增量？** 增量意味着 agent 要维护「上一次是什么」这个额外状态，模型得说「把第 3 项标成完成」，双方都得数序号。一旦模型的序号对不上，清单就乱了。覆盖式没有这个问题：模型手里的清单就是唯一真相，传什么就是什么。代价是每次调用多传几个 token，对于通常不超过十项的清单来说完全可以接受。
+
+注意这两行是**原地修改**而不是重新赋值。`ctx.todos` 和 agent 内部的 `this.#todos` 是同一个数组对象：
+
+```ts title="src/agent.ts"
+        todos: this.#todos,
+        fileReads: this.#fileReads,
+```
+
+如果写成 `ctx.todos = input.todos`，`ctx` 上的属性就指向一个新数组了，agent 自己那份 `this.#todos` 根本不会更新，终端 UI 永远读到空清单。原地修改才能保证两边看到的是同一份数据。
+
+## 同一时刻最多一个 in_progress
+
+```ts title="src/tools/bash-tool.ts"
+  async execute(input, ctx) {
+    const inProgress = input.todos.filter((todo) => todo.status === 'in_progress');
+
+    if (inProgress.length > 1) {
+      return {
+        content: `有 ${inProgress.length} 个任务同时处于 in_progress，请只保留一个。`,
+        isError: true,
+      };
+    }
+```
+
+只有一个任务能处于 `in_progress`，因为「同时在做三件事」对模型来说等于「一件都没在做」。这一条约束逼模型一次只专注一件事，做完标记完成，再标下一个。
+
+不满足时工具**拒绝执行**，返回错误而不是默默修正：
+
+```ts title="test/tools.test.ts"
+test('TodoWrite 拒绝同时存在多个进行中的任务', async () => {
+  await withSandbox(async (cwd) => {
+    const result = await registry.get('TodoWrite')!.execute(
+      {
+        todos: [
+          { content: 'a', status: 'in_progress' },
+          { content: 'b', status: 'in_progress' },
+        ],
+      },
+      makeContext(cwd),
+    );
+
+    assert.equal(result.isError, true);
+  });
+});
+```
+
+注意这里是「拒绝」而不是「自动把多余的改成 pending」。自动修正是实现细节，模型不会知道自己写错了；报错则能让模型在下一次调用时改对。
+
+## 它在 agent 循环里的位置
+
+TodoWrite 不是一个特殊工具，它和别的工具走完全一样的路径。以 `Agent.run()` 的主循环为准：
+
+```ts title="src/agent.ts"
+    for (let turn = 0; turn < maxTurns; turn++) {
+      await this.#maybeCompact();
+
+      const assistantMessage = await this.#callModel();
+      const reasoning = (assistantMessage as typeof assistantMessage & { reasoning_content?: string }).reasoning_content;
+      this.#messages.push({ role: 'assistant', content: assistantMessage.content, ...(reasoning !== undefined ? { reasoning_content: reasoning } : {}) });
+
+      const toolUses = assistantMessage.content.filter(
+        (block): block is ToolUseBlock => block.type === 'tool_use',
+      );
+
+      // 没有工具调用 -> 这一轮结束
+      if (assistantMessage.stop_reason !== 'tool_use' || toolUses.length === 0) {
+        return;
+      }
+
+      // 串行执行，避免写入竞争和确认提示交错。
+      const results: ToolResultBlockParam[] = [];
+      for (const toolUse of toolUses) results.push(await this.#runTool(toolUse));
+
+      // 工具结果必须作为 user 消息回传，这是 Anthropic API 的协议要求
+      this.#messages.push({ role: 'user', content: results });
+    }
+```
+
+一轮是这样的：
+
+1. **模型调用工具**——这一轮模型返回的 content 里包含 `tool_use` 块，其中一个可能是 `TodoWrite`。
+2. **结果回传**——`#runTool` 执行工具，把结果转成 `tool_result` 块。
+3. **模型看到清单更新**——这些块作为一条 `user` 消息追加进 `#messages`，下一轮请求模型时，清单的内容已经在上下文里了。
+
+`tool_result` 块的形状：
+
+```ts title="src/agent.ts"
+  #toToolResult(
+    toolUseId: string,
+    result: ToolResult,
+  ): ToolResultBlockParam {
+    return {
+      type: 'tool_result',
+      tool_use_id: toolUseId,
+      content: result.content,
+      is_error: result.isError,
+    };
+  }
+```
+
+`content` 就是渲染好的清单：
+
+```ts title="src/tools/bash-tool.ts"
+    const rendered = input.todos
+      .map((todo) => {
+        const mark = todo.status === 'completed' ? 'x' : todo.status === 'in_progress' ? '>' : ' ';
+        return `[${mark}] ${todo.content}`;
+      })
+      .join('\n');
+
+    return { content: `待办清单已更新：\n${rendered}` };
+```
+
+`[x]` 表示已完成，`[>` 表示进行中，`[ ]` 表示待办。这个渲染同时给了人和模型：你在终端里看到的是同一份清单，模型下一轮看到的是同一份清单。
+
+同一轮工具调用按顺序执行，避免待办更新与其他有副作用的操作相互干扰。
+
+## 工具返回错误是正常的信息通道
+
+<Callout type="idea" title="工具报错不是失败，是沟通">
+  工具返回一个 `isError: true` 的结果，不代表 agent 出错了。它只是告诉模型：
+  「你刚才那么做不行，原因是 X。」模型看到这个信息会自己调整策略——把
+  `old_string` 写得更长、把两个 `in_progress` 合成一个、换个模式重搜。
+  这套机制里没有重试次数、没有异常分类、没有退避策略，因为模型本身就是那个
+  「看到错误就换个做法」的决策者。
+</Callout>
+
+这个设计有一个直接的好处：工具不需要把所有失败情况都写成异常。所有失败都走同一个出口——返回一段人类可读的文本加上 `isError: true`。这既是给人看的日志，也是给模型看的观察结果。
+
+它也解释了为什么工具描述要写得那么清楚：模型是靠描述来「第一次就做对」，靠错误信息来「第二次做对」。描述含糊，模型就会在错误里来回打转。
+
+## 小结
+
+- TodoWrite 的入参是一份完整清单，每项含 `content`、`status`、`activeForm`。
+- 更新是覆盖式的，模型每次传全量清单，避免了增量更新的状态同步问题。
+- 原地修改数组（`ctx.todos.length = 0` 再 push），保证 agent 和工具看到同一份数据。
+- 同一时刻只允许一个 `in_progress`，不满足就报错让模型改。
+- 它走的是普通工具通道：模型调用 → 结果作为 `tool_result` 回传 → 模型在下一轮看到清单。
+- 工具报错是信息通道，不是故障——模型看到 `isError` 会自行调整策略。
